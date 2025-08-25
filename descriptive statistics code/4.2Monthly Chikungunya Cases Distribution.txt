@@ -1,0 +1,423 @@
+# Chikungunya Fever Time Series Visualization - Optimized Version Based on Malaria Analysis Code
+# Author: Analysis Script
+# Date: 2025
+
+# Clear environment
+rm(list = ls())
+
+# Load necessary packages
+library(readr)        # Read CSV files
+library(dplyr)        # Data processing
+library(ggplot2)      # Basic plotting
+library(lubridate)    # Date processing
+library(scales)       # Scales and formatting
+library(gridExtra)    # Plot combination
+library(RColorBrewer) # Color palettes
+library(viridis)      # Modern color schemes
+library(zoo)          # Moving averages
+library(writexl)      # Export Excel
+library(data.table)   # Efficient data processing
+
+# Set Chinese font support (Windows system)
+if (.Platform$OS.type == "windows") {
+  windowsFonts(myFont = windowsFont("Arial"))
+  par(family = "myFont")
+}
+
+# Set working directory and output folder
+output_dir <- "C:/Users/a1230/Desktop/chikungunya_timeseries"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("========== Chikungunya Fever Time Series Visualization ==========\n")
+
+#####################################
+## 1. Data Loading and Preprocessing
+#####################################
+
+cat("\n======= Loading Data =======\n")
+
+# Read data
+data_path <- "C:/Users/a1230/Desktop/基孔肯雅热/chikungunya_weather_population_merged.csv"
+
+# Try different encodings to read data
+chik_data <- tryCatch({
+  read_csv(data_path, locale = locale(encoding = "UTF-8"))
+}, error = function(e) {
+  cat("UTF-8 failed, trying other encoding...\n")
+  read_csv(data_path, locale = locale(encoding = "GBK"))
+})
+
+# Convert to data.table for improved processing efficiency
+setDT(chik_data)
+
+cat("Data loaded successfully:", nrow(chik_data), "rows,", ncol(chik_data), "columns\n")
+
+# Data preprocessing
+chik_data[, Y := as.numeric(Y)]
+chik_data[, year := as.integer(year)]
+chik_data[, month := as.integer(month)]
+chik_data[, temperature_mean := as.numeric(temperature_mean)]
+chik_data[, temp_max_mean := as.numeric(temp_max_mean)]
+chik_data[, temp_min_mean := as.numeric(temp_min_mean)]
+chik_data[, humidity_mean := as.numeric(humidity_mean)]
+chik_data[, rainfall_mean := as.numeric(rainfall_mean)]
+chik_data[, hospital := as.numeric(hospital)]
+chik_data[, ICU := as.numeric(ICU)]
+
+# Handle missing values
+chik_data[is.na(Y), Y := 0]
+
+# Create date variable
+chik_data[, date := as.Date(paste(year, month, "01", sep = "-"))]
+chik_data[, year_month := paste(year, sprintf("%02d", month), sep = "-")]
+
+# Filter outliers
+chik_data_clean <- chik_data[
+  !is.na(Y) & !is.na(date) & Y >= 0 & year >= 2010 & year <= 2025
+]
+
+cat("Data cleaning completed:", nrow(chik_data_clean), "rows retained\n")
+cat("Time range:", min(chik_data_clean$year), "-", max(chik_data_clean$year), "\n")
+cat("Total number of cities:", length(unique(chik_data_clean$cityid)), "\n")
+
+#####################################
+## 2. Data Aggregation - Following Malaria Code Structure
+#####################################
+
+cat("\n======= Data Aggregation =======\n")
+
+# Annual summary
+yearly_summary <- chik_data_clean %>%
+  group_by(year) %>%
+  summarise(
+    total_cases = sum(Y, na.rm = TRUE),
+    avg_cases_per_month = mean(Y, na.rm = TRUE),
+    cities_count = n_distinct(cityid),
+    avg_temperature = mean(temperature_mean, na.rm = TRUE),
+    avg_temp_max = mean(temp_max_mean, na.rm = TRUE),
+    avg_temp_min = mean(temp_min_mean, na.rm = TRUE),
+    avg_humidity = mean(humidity_mean, na.rm = TRUE),
+    avg_rainfall = mean(rainfall_mean, na.rm = TRUE),
+    total_hospital = sum(hospital, na.rm = TRUE),
+    total_icu = sum(ICU, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(year)
+
+# Calculate annual growth rate
+yearly_summary <- yearly_summary %>%
+  mutate(
+    cases_growth_rate = (total_cases / lag(total_cases) - 1) * 100,
+    cases_change = total_cases - lag(total_cases)
+  )
+
+# Monthly summary (cross-year aggregation)
+monthly_summary <- chik_data_clean %>%
+  group_by(month) %>%
+  summarise(
+    total_cases = sum(Y, na.rm = TRUE),
+    avg_cases = mean(Y, na.rm = TRUE),
+    median_cases = median(Y, na.rm = TRUE),
+    cases_sd = sd(Y, na.rm = TRUE),
+    avg_temperature = mean(temperature_mean, na.rm = TRUE),
+    avg_humidity = mean(humidity_mean, na.rm = TRUE),
+    avg_rainfall = mean(rainfall_mean, na.rm = TRUE),
+    total_hospital = sum(hospital, na.rm = TRUE),
+    total_icu = sum(ICU, na.rm = TRUE),
+    records_count = n(),
+    .groups = 'drop'
+  ) %>%
+  arrange(month) %>%
+  mutate(
+    month_name = month.abb[month],
+    month_english = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")[month]
+  )
+
+# Monthly-yearly combined summary
+monthly_yearly_summary <- chik_data_clean %>%
+  group_by(year, month) %>%
+  summarise(
+    total_cases = sum(Y, na.rm = TRUE),
+    avg_cases = mean(Y, na.rm = TRUE),
+    avg_temperature = mean(temperature_mean, na.rm = TRUE),
+    avg_humidity = mean(humidity_mean, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    date = as.Date(paste(year, month, "01", sep = "-")),
+    month_name = month.abb[month]
+  ) %>%
+  arrange(year, month)
+
+cat("Aggregation completed - Annual data:", nrow(yearly_summary), "rows\n")
+cat("Aggregation completed - Monthly data:", nrow(monthly_summary), "rows\n")
+
+#####################################
+## 3. Create Annual Trend Charts - Following Nature Color Scheme
+#####################################
+
+cat("\n======= Creating Annual Trend Charts =======\n")
+
+# Chart 1: Annual Chikungunya incidence trend
+p1 <- ggplot(yearly_summary, aes(x = year)) +
+  geom_line(aes(y = total_cases), color = "#2E8B57", linewidth = 1.5) +
+  geom_point(aes(y = total_cases), color = "#2E8B57", size = 3) +
+  geom_smooth(aes(y = total_cases), method = "loess", se = TRUE, 
+              alpha = 0.3, color = "#4682B4") +
+  labs(
+    title = "Annual Chikungunya Cases Trend",
+    subtitle = paste("Data period:", min(yearly_summary$year), "-", max(yearly_summary$year)),
+    x = "Year",
+    y = "Total Chikungunya Cases"
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_continuous(breaks = pretty_breaks(n = 8)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    panel.grid.minor = element_blank()
+  )
+
+# Chart 2: Annual growth rate
+p2 <- ggplot(yearly_summary[-1, ], aes(x = year, y = cases_growth_rate)) +
+  geom_col(aes(fill = cases_growth_rate > 0), alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#8B4513") +
+  scale_fill_manual(values = c("TRUE" = "#228B22", "FALSE" = "#D2691E"), 
+                    labels = c("TRUE" = "Positive growth", "FALSE" = "Negative growth"),
+                    name = "",
+                    guide = guide_legend(override.aes = list(alpha = 1))) +
+  labs(
+    title = "Annual Chikungunya Cases Growth Rate",
+    x = "Year",
+    y = "Growth Rate (%)"
+  ) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    legend.position = "bottom",
+    legend.key.width = unit(1.5, "cm"),
+    legend.text = element_text(size = 12)
+  )
+
+#####################################
+## 4. Create Monthly Trend Charts
+#####################################
+
+cat("\n======= Creating Monthly Trend Charts =======\n")
+
+# Create nature-style gradient color palette
+nature_colors <- colorRampPalette(c("#4682B4", "#5F9EA0", "#20B2AA", 
+                                    "#3CB371", "#228B22", "#2E8B57"))(12)
+
+# Chart 3: Monthly incidence distribution (bar chart)
+p3 <- ggplot(monthly_summary, aes(x = factor(month), y = total_cases)) +
+  geom_col(aes(fill = total_cases), alpha = 0.85) +
+  scale_fill_gradientn(colors = nature_colors, name = "Cases",
+                       guide = guide_colorbar(barwidth = 15, barheight = 1,
+                                              title.position = "top", title.hjust = 0.5)) +
+  labs(
+    title = "Monthly Chikungunya Cases Distribution",
+    subtitle = "Monthly aggregation based on all years data",
+    x = "Month",
+    y = "Total Cases"
+  ) +
+  scale_x_discrete(labels = monthly_summary$month_english) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
+  )
+
+# Chart 4: Monthly average incidence trend line
+p4 <- ggplot(monthly_summary, aes(x = month, y = avg_cases)) +
+  geom_line(color = "#2E8B57", linewidth = 1.5) +
+  geom_point(color = "#2E8B57", size = 3) +
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.3, color = "#4682B4") +
+  labs(
+    title = "Monthly Average Chikungunya Cases Trend",
+    subtitle = "Shows seasonal patterns",
+    x = "Month",
+    y = "Average Cases"
+  ) +
+  scale_x_continuous(breaks = 1:12, labels = monthly_summary$month_english) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+#####################################
+## 5. Create Time Series Trend Charts
+#####################################
+
+cat("\n======= Creating Time Series Trend Charts =======\n")
+
+# Chart 5: Monthly time series trend
+p5 <- ggplot(monthly_yearly_summary, aes(x = date, y = total_cases)) +
+  geom_line(color = "#2E8B57", linewidth = 1) +
+  geom_point(color = "#2E8B57", size = 1.5, alpha = 0.7) +
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.3, color = "#4682B4") +
+  labs(
+    title = "Chikungunya Cases Time Series Trend",
+    subtitle = "Monthly cases over time with trend line",
+    x = "Date",
+    y = "Monthly Cases"
+  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Chart 6: Cases vs temperature relationship - simplified version
+p6 <- ggplot(monthly_yearly_summary, aes(x = date)) +
+  # Cases area chart
+  geom_area(aes(y = total_cases), fill = "#E74C3C", alpha = 0.3) +
+  geom_line(aes(y = total_cases), color = "#E74C3C", linewidth = 1.5) +
+  # Temperature line chart (scaled display)
+  geom_line(aes(y = avg_temperature * 100), color = "#2E8B57", linewidth = 1.5) +
+  labs(
+    title = "Chikungunya Cases vs Temperature Over Time",
+    subtitle = "Red: Cases, Green: Temperature (×100 scaled)",
+    x = "Date",
+    y = "Cases / Temperature (×100)",
+    caption = "Green line shows temperature scaled by 100 for visualization"
+  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.caption = element_text(size = 10, hjust = 1)
+  )
+
+#####################################
+## 6. Save Charts - Only Save Two Combined Charts
+#####################################
+
+cat("\n======= Saving Charts =======\n")
+
+# Create combined charts - following malaria code saving method
+combined_yearly <- grid.arrange(p1, p2, ncol = 1, 
+                                top = "Annual Chikungunya Cases Trend Analysis")
+combined_monthly <- grid.arrange(p3, p4, ncol = 1, 
+                                 top = "Monthly Chikungunya Cases Trend Analysis")
+combined_timeseries <- grid.arrange(p5, p6, ncol = 1, 
+                                    top = "Chikungunya Time Series and Temperature Analysis")
+
+ggsave(file.path(output_dir, "chikungunya_annual_analysis.png"), 
+       combined_yearly, width = 14, height = 12, dpi = 300)
+ggsave(file.path(output_dir, "chikungunya_monthly_analysis.png"), 
+       combined_monthly, width = 14, height = 12, dpi = 300)
+ggsave(file.path(output_dir, "chikungunya_timeseries_analysis.png"), 
+       combined_timeseries, width = 14, height = 12, dpi = 300)
+
+#####################################
+## 7. Save Summary Statistics Results
+#####################################
+
+cat("\n======= Saving Summary Statistics Results =======\n")
+
+# Save summary data as Excel file
+summary_data <- list(
+  "Annual_Summary" = yearly_summary,
+  "Monthly_Summary" = monthly_summary,
+  "Monthly_Yearly_Summary" = monthly_yearly_summary
+)
+
+write_xlsx(summary_data, file.path(output_dir, "chikungunya_timeseries_summary.xlsx"))
+
+# Save as CSV files
+write.csv(yearly_summary, file.path(output_dir, "yearly_summary.csv"), row.names = FALSE)
+write.csv(monthly_summary, file.path(output_dir, "monthly_summary.csv"), row.names = FALSE)
+
+#####################################
+## 8. Generate Analysis Report
+#####################################
+
+cat("\n======= Generating Analysis Report =======\n")
+
+# Calculate key statistical indicators
+total_cases_all_years <- sum(yearly_summary$total_cases, na.rm = TRUE)
+peak_year <- yearly_summary$year[which.max(yearly_summary$total_cases)]
+peak_month <- monthly_summary$month[which.max(monthly_summary$total_cases)]
+
+# Generate text report
+report <- paste0(
+  "Chikungunya Incidence Time Series Analysis Report\n",
+  "================================================\n\n",
+  "Data Overview:\n",
+  "- Analysis period: ", min(yearly_summary$year), " - ", max(yearly_summary$year), "\n",
+  "- Total cases: ", format(total_cases_all_years, big.mark = ","), "\n",
+  "- Average annual cases: ", format(round(total_cases_all_years / nrow(yearly_summary)), big.mark = ","), "\n",
+  "- Number of cities analyzed: ", length(unique(chik_data_clean$cityid)), "\n\n",
+  
+  "Key Findings:\n",
+  "- Peak year: ", peak_year, " (", format(max(yearly_summary$total_cases), big.mark = ","), " cases)\n",
+  "- Peak month: ", peak_month, " (", monthly_summary$month_english[peak_month], ")\n",
+  "- Average temperature: ", round(mean(yearly_summary$avg_temperature, na.rm = TRUE), 1), "°C\n\n",
+  
+  "Trend Characteristics:\n",
+  if (nrow(yearly_summary) > 1) {
+    paste0("- Recent trend: ", 
+           ifelse(yearly_summary$cases_growth_rate[nrow(yearly_summary)] > 0, "Increasing", "Decreasing"),
+           " (", round(yearly_summary$cases_growth_rate[nrow(yearly_summary)], 1), "%)\n")
+  } else "",
+  
+  "Generated Files:\n",
+  "1. Annual chikungunya cases trend analysis\n",
+  "2. Monthly chikungunya cases trend analysis\n",
+  "3. Time series and temperature analysis\n",
+  "4. Summary statistics tables\n\n",
+  
+  "Files saved to: ", output_dir, "\n"
+)
+
+# Save report
+writeLines(report, file.path(output_dir, "analysis_report.txt"))
+
+# Console output report
+cat(report)
+
+cat("\n======= Chikungunya Fever Time Series Analysis Complete! =======\n")
+cat("Three combined charts have been saved to:", output_dir, "\n")
+cat("Please check the generated charts to understand the temporal trends and seasonal patterns of chikungunya incidence.\n")

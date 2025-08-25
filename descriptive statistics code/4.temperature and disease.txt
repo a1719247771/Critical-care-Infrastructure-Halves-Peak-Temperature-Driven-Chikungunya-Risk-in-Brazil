@@ -1,0 +1,477 @@
+# Complete Chikungunya Fever Time Series Analysis
+# Author: Analysis Script
+# Date: 2025
+
+# Clear environment and load packages
+rm(list = ls())
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+library(gridExtra)
+library(viridis)
+library(RColorBrewer)
+library(data.table)
+library(corrplot)
+library(ggcorrplot)
+
+# Set output directory
+output_dir <- "C:/Users/a1230/Desktop/chikungunya_comprehensive_analysis"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("========== Complete Chikungunya Fever Time Series Analysis ==========\n")
+
+#####################################
+## 1. Data Loading and Preprocessing
+#####################################
+
+cat("\n======= Loading Data =======\n")
+
+# Read data - fix encoding issues
+data_path <- "C:/Users/a1230/Desktop/基孔肯雅热/chikungunya_weather_population_merged.csv"
+
+# Try multiple encoding methods to read data
+chik_data <- tryCatch({
+  # First try UTF-8
+  read_csv(data_path, locale = locale(encoding = "UTF-8"))
+}, error = function(e1) {
+  cat("UTF-8 encoding failed, trying UTF-8-BOM...\n")
+  tryCatch({
+    read_csv(data_path, locale = locale(encoding = "UTF-8-BOM"))
+  }, error = function(e2) {
+    cat("UTF-8-BOM encoding failed, trying GBK...\n")
+    tryCatch({
+      read_csv(data_path, locale = locale(encoding = "GBK"))
+    }, error = function(e3) {
+      cat("GBK encoding failed, trying latin1...\n")
+      tryCatch({
+        read_csv(data_path, locale = locale(encoding = "latin1"))
+      }, error = function(e4) {
+        cat("All encodings failed, using base R read...\n")
+        # Use base R read.csv as last resort
+        read.csv(data_path, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+      })
+    })
+  })
+})
+
+# If still fails, try to specify all columns as character type
+if(!exists("chik_data") || nrow(chik_data) == 0) {
+  cat("Trying to read all columns as character type...\n")
+  chik_data <- read_csv(data_path, 
+                        locale = locale(encoding = "UTF-8"),
+                        col_types = cols(.default = "c"))
+}
+
+# Check if data loaded successfully
+if(exists("chik_data") && nrow(chik_data) > 0) {
+  cat("Data loaded successfully:", nrow(chik_data), "rows", ncol(chik_data), "columns\n")
+  
+  # Clean column names, remove possible special characters
+  colnames(chik_data) <- iconv(colnames(chik_data), to = "UTF-8", sub = "")
+  colnames(chik_data) <- gsub("[^[:alnum:]_]", "_", colnames(chik_data))
+  
+  cat("Column names:", paste(colnames(chik_data)[1:min(10, ncol(chik_data))], collapse = ", "), "...\n")
+} else {
+  stop("Unable to load data file, please check file path and encoding")
+}
+
+# Data cleaning - enhanced version
+chik_data_clean <- chik_data %>%
+  # Safely convert numeric columns
+  mutate(
+    Y = suppressWarnings(as.numeric(as.character(Y))),
+    year = suppressWarnings(as.integer(as.character(year))),
+    month = suppressWarnings(as.integer(as.character(month))),
+    temperature_mean = suppressWarnings(as.numeric(as.character(temperature_mean))),
+    temp_max_mean = suppressWarnings(as.numeric(as.character(temp_max_mean))),
+    temp_min_mean = suppressWarnings(as.numeric(as.character(temp_min_mean))),
+    humidity_mean = suppressWarnings(as.numeric(as.character(humidity_mean))),
+    rainfall_mean = suppressWarnings(as.numeric(as.character(rainfall_mean)))
+  ) %>%
+  # Create date variable (using safe method)
+  mutate(
+    date = tryCatch({
+      as.Date(paste(year, month, "01", sep = "-"))
+    }, error = function(e) {
+      as.Date(paste(ifelse(is.na(year), 2015, year), 
+                    ifelse(is.na(month), 1, month), "01", sep = "-"))
+    })
+  ) %>%
+  # Filter data
+  filter(
+    !is.na(Y), !is.na(date), Y >= 0,
+    year >= 2010, year <= 2025,
+    !is.na(temperature_mean),
+    month >= 1, month <= 12
+  ) %>%
+  # Handle missing values
+  mutate(Y = ifelse(is.na(Y), 0, Y))
+
+# Check cleaned data
+cat("After data cleaning:", nrow(chik_data_clean), "rows retained\n")
+if(nrow(chik_data_clean) > 0) {
+  cat("Y column statistics:\n")
+  print(summary(chik_data_clean$Y))
+  cat("Temperature column statistics:\n") 
+  print(summary(chik_data_clean$temperature_mean))
+} else {
+  stop("No valid data after cleaning, please check data format")
+}
+
+# Monthly aggregated data - safe version
+monthly_data <- chik_data_clean %>%
+  # Ensure data validity
+  filter(!is.na(year), !is.na(month), !is.na(date)) %>%
+  group_by(year, month, date) %>%
+  summarise(
+    total_cases = sum(Y, na.rm = TRUE),
+    avg_temp = mean(temperature_mean, na.rm = TRUE),
+    avg_temp_max = mean(temp_max_mean, na.rm = TRUE),
+    avg_temp_min = mean(temp_min_mean, na.rm = TRUE),
+    avg_humidity = mean(humidity_mean, na.rm = TRUE),
+    avg_rainfall = mean(rainfall_mean, na.rm = TRUE),
+    records_count = n(),
+    .groups = 'drop'
+  ) %>%
+  # Filter out invalid aggregated data
+  filter(
+    !is.na(total_cases), 
+    !is.na(avg_temp),
+    records_count > 0
+  ) %>%
+  arrange(date)
+
+# Check monthly data
+if(nrow(monthly_data) > 0) {
+  cat("Monthly data aggregation completed:", nrow(monthly_data), "monthly data points\n")
+  cat("Time range:", as.character(min(monthly_data$date)), "to", as.character(max(monthly_data$date)), "\n")
+  cat("Total cases:", format(sum(monthly_data$total_cases, na.rm = TRUE), big.mark = ","), "\n")
+  cat("Temperature range:", round(min(monthly_data$avg_temp, na.rm = TRUE), 1), "°C to", 
+      round(max(monthly_data$avg_temp, na.rm = TRUE), 1), "°C\n")
+} else {
+  stop("Monthly data aggregation failed, please check original data")
+}
+
+#####################################
+## 2. Figure 1: Complete Time Series Trend Plot (Bar Chart + Line Chart)
+#####################################
+
+cat("\n======= Creating Complete Time Series Trend Plot =======\n")
+
+p1 <- ggplot(monthly_data, aes(x = date)) +
+  # Bar chart showing monthly cases
+  geom_col(aes(y = total_cases), 
+           fill = "#E74C3C", alpha = 0.7, width = 20) +
+  # Add smooth trend line
+  geom_smooth(aes(y = total_cases), 
+              method = "loess", span = 0.3, se = TRUE,
+              color = "#2E8B57", linewidth = 1.5,
+              fill = "#2E8B57", alpha = 0.2) +
+  # Add annual marker lines
+  geom_vline(xintercept = as.Date(paste(seq(2011, 2024, 2), "01", "01", sep = "-")),
+             linetype = "dashed", color = "gray60", alpha = 0.5) +
+  labs(
+    title = "Chikungunya Fever Monthly Incidence Time Series (2010-2024)",
+    subtitle = "Red bars: Monthly cases | Green line: Long-term trend",
+    x = "Time",
+    y = "Monthly Cases",
+    caption = "Data source: Brazil Chikungunya Fever Surveillance Data"
+  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "2 years") +
+  scale_y_continuous(labels = comma_format()) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    plot.caption = element_text(size = 10, hjust = 1, color = "gray50")
+  )
+
+#####################################
+## 3. Figure 2: Annual Heatmap
+#####################################
+
+cat("\n======= Creating Annual Heatmap =======\n")
+
+# Prepare heatmap data
+heatmap_data <- monthly_data %>%
+  mutate(
+    month_name = factor(month.abb[month], levels = month.abb),
+    log_cases = log10(total_cases + 1)
+  )
+
+p2 <- ggplot(heatmap_data, aes(x = factor(year), y = month_name, fill = log_cases)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = ifelse(total_cases > 1000, 
+                               format(round(total_cases/1000, 1)), "")),
+            size = 2.5, color = "white", fontface = "bold") +
+  scale_fill_viridis_c(
+    name = "Log10(Cases+1)", 
+    option = "plasma",
+    na.value = "gray90"
+  ) +
+  labs(
+    title = "Chikungunya Fever Incidence Heatmap (by Year and Month)",
+    subtitle = "Color intensity represents case count level, numbers in thousands",
+    x = "Year",
+    y = "Month"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+#####################################
+## 4. Figure 3: Case Count vs Temperature Relationship - Time Series Comparison
+#####################################
+
+cat("\n======= Creating Case Count vs Temperature Time Series Comparison =======\n")
+
+# Standardize data for comparison
+monthly_data_scaled <- monthly_data %>%
+  mutate(
+    cases_scaled = scale(total_cases)[,1],
+    temp_scaled = scale(avg_temp)[,1],
+    temp_max_scaled = scale(avg_temp_max)[,1],
+    temp_min_scaled = scale(avg_temp_min)[,1]
+  )
+
+p3 <- ggplot(monthly_data_scaled, aes(x = date)) +
+  # Standardized case count curve
+  geom_line(aes(y = cases_scaled, color = "Case Count"), linewidth = 1.2) +
+  # Standardized average temperature curve
+  geom_line(aes(y = temp_scaled, color = "Average Temperature"), linewidth = 1.2) +
+  # Standardized maximum temperature curve
+  geom_line(aes(y = temp_max_scaled, color = "Maximum Temperature"), 
+            linewidth = 1, linetype = "dashed") +
+  scale_color_manual(
+    name = "Indicator",
+    values = c("Case Count" = "#E74C3C", 
+               "Average Temperature" = "#3498DB", 
+               "Maximum Temperature" = "#F39C12")
+  ) +
+  labs(
+    title = "Chikungunya Fever Case Count vs Temperature Time Series Comparison",
+    subtitle = "Standardized data for trend correlation observation",
+    x = "Time",
+    y = "Standardized Values",
+    caption = "Values standardized (mean=0, std=1)"
+  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "2 years") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    legend.title = element_text(size = 12, face = "bold"),
+    plot.caption = element_text(size = 10, hjust = 1, color = "gray50")
+  )
+
+#####################################
+## 5. Figure 4: Scatter Plot - Case Count vs Temperature Relationship
+#####################################
+
+cat("\n======= Creating Scatter Plot Analysis =======\n")
+
+p4 <- ggplot(monthly_data, aes(x = avg_temp, y = total_cases)) +
+  geom_point(aes(color = factor(month)), size = 2, alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "#2E8B57", 
+              fill = "#2E8B57", alpha = 0.2) +
+  scale_color_viridis_d(name = "Month", option = "plasma") +
+  labs(
+    title = "Chikungunya Fever Case Count vs Average Temperature Scatter Plot",
+    subtitle = "Different months shown in different colors",
+    x = "Average Temperature (°C)",
+    y = "Monthly Cases",
+    caption = paste("Correlation coefficient r =", 
+                    round(cor(monthly_data$total_cases, monthly_data$avg_temp, 
+                              use = "complete.obs"), 3))
+  ) +
+  scale_y_continuous(labels = comma_format()) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.position = "right",
+    plot.caption = element_text(size = 12, hjust = 1, color = "gray50", face = "bold")
+  )
+
+#####################################
+## 6. Figure 5: Seasonal Pattern Analysis
+#####################################
+
+cat("\n======= Creating Seasonal Pattern Analysis =======\n")
+
+# Group by season
+seasonal_data <- monthly_data %>%
+  mutate(
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "Summer (Dec-Feb)",
+      month %in% c(3, 4, 5) ~ "Autumn (Mar-May)",
+      month %in% c(6, 7, 8) ~ "Winter (Jun-Aug)",
+      month %in% c(9, 10, 11) ~ "Spring (Sep-Nov)"
+    ),
+    season = factor(season, levels = c("Summer (Dec-Feb)", "Autumn (Mar-May)", 
+                                       "Winter (Jun-Aug)", "Spring (Sep-Nov)"))
+  )
+
+p5 <- ggplot(seasonal_data, aes(x = season, y = total_cases)) +
+  geom_boxplot(aes(fill = season), alpha = 0.7, outlier.size = 1) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1) +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(
+    title = "Chikungunya Fever Seasonal Incidence Pattern",
+    subtitle = "Boxplot shows case count distribution by season",
+    x = "Season",
+    y = "Monthly Cases"
+  ) +
+  scale_y_continuous(labels = comma_format()) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+#####################################
+## 7. Figure 6: Correlation Matrix
+#####################################
+
+cat("\n======= Creating Correlation Analysis =======\n")
+
+# Prepare correlation analysis data
+cor_data <- monthly_data %>%
+  select(total_cases, avg_temp, avg_temp_max, avg_temp_min, 
+         avg_humidity, avg_rainfall) %>%
+  rename(
+    "Case Count" = total_cases,
+    "Average Temp" = avg_temp,
+    "Max Temp" = avg_temp_max,
+    "Min Temp" = avg_temp_min,
+    "Humidity" = avg_humidity,
+    "Rainfall" = avg_rainfall
+  )
+
+# Calculate correlation coefficient matrix
+cor_matrix <- cor(cor_data, use = "complete.obs")
+
+p6 <- ggcorrplot(cor_matrix, 
+                 hc.order = TRUE,
+                 type = "lower",
+                 lab = TRUE,
+                 lab_size = 4,
+                 colors = c("#E74C3C", "white", "#2E8B57"),
+                 title = "Chikungunya Fever vs Meteorological Factors Correlation Analysis") +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 12)
+  )
+
+#####################################
+## 8. Save All Charts
+#####################################
+
+cat("\n======= Saving Charts =======\n")
+
+# Create combined charts
+combined_timeseries <- grid.arrange(p1, p2, ncol = 1, heights = c(2, 1.5),
+                                    top = "Chikungunya Fever Time Series Analysis")
+
+combined_temperature <- grid.arrange(p3, p4, ncol = 1, heights = c(1.5, 2),
+                                     top = "Chikungunya Fever vs Temperature Relationship Analysis")
+
+combined_patterns <- grid.arrange(p5, p6, ncol = 2, widths = c(1.5, 2),
+                                  top = "Chikungunya Fever Seasonal and Correlation Analysis")
+
+# Save charts
+ggsave(file.path(output_dir, "1_chikungunya_timeseries_analysis.png"), 
+       combined_timeseries, width = 16, height = 12, dpi = 300)
+
+ggsave(file.path(output_dir, "2_chikungunya_temperature_analysis.png"), 
+       combined_temperature, width = 16, height = 12, dpi = 300)
+
+ggsave(file.path(output_dir, "3_chikungunya_patterns_analysis.png"), 
+       combined_patterns, width = 16, height = 10, dpi = 300)
+
+# Save important charts separately
+ggsave(file.path(output_dir, "timeseries_main.png"), 
+       p1, width = 14, height = 8, dpi = 300)
+
+ggsave(file.path(output_dir, "heatmap_main.png"), 
+       p2, width = 12, height = 8, dpi = 300)
+
+ggsave(file.path(output_dir, "temperature_comparison.png"), 
+       p3, width = 14, height = 8, dpi = 300)
+
+#####################################
+## 9. Statistical Summary
+#####################################
+
+cat("\n======= Generating Statistical Summary =======\n")
+
+# Calculate key statistical indicators
+peak_year_month <- monthly_data[which.max(monthly_data$total_cases), ]
+correlation_temp <- cor(monthly_data$total_cases, monthly_data$avg_temp, use = "complete.obs")
+correlation_humidity <- cor(monthly_data$total_cases, monthly_data$avg_humidity, use = "complete.obs")
+
+# Seasonal statistics
+seasonal_stats <- seasonal_data %>%
+  group_by(season) %>%
+  summarise(
+    avg_cases = mean(total_cases),
+    median_cases = median(total_cases),
+    max_cases = max(total_cases),
+    .groups = 'drop'
+  )
+
+# Generate report
+report <- paste0(
+  "Chikungunya Fever Time Series Analysis Report\n",
+  "============================================\n\n",
+  "Data Overview:\n",
+  "- Analysis period: ", min(monthly_data$date), " to ", max(monthly_data$date), "\n",
+  "- Total cases: ", format(sum(monthly_data$total_cases), big.mark = ","), "\n",
+  "- Monthly data points: ", nrow(monthly_data), "\n\n",
+  
+  "Key Findings:\n",
+  "- Peak incidence: ", peak_year_month$year, " Year ", peak_year_month$month, " Month (",
+  format(peak_year_month$total_cases, big.mark = ","), " cases)\n",
+  "- Cases vs average temperature correlation: ", round(correlation_temp, 3), "\n",
+  "- Cases vs humidity correlation: ", round(correlation_humidity, 3), "\n\n",
+  
+  "Seasonal Characteristics:\n",
+  paste(apply(seasonal_stats, 1, function(x) 
+    paste("- ", x[1], ": Average", round(as.numeric(x[2])), "cases/month")), collapse = "\n"), "\n\n",
+  
+  "Generated Files:\n",
+  "1. Time series analysis plots (Complete trend + Heatmap)\n",
+  "2. Temperature relationship analysis plots (Time comparison + Scatter plot)\n",
+  "3. Pattern analysis plots (Seasonal + Correlation)\n\n"
+)
+
+writeLines(report, file.path(output_dir, "analysis_summary.txt"))
+cat(report)
+
+cat("\n======= Analysis Complete =======\n")
+cat("All charts saved to:", output_dir, "\n")
+cat("Please check the generated chart files for detailed time trends and temperature relationships.\n")

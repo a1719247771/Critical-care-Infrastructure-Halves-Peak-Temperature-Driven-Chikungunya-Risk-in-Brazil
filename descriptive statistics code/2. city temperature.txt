@@ -1,0 +1,518 @@
+# Temperature Visualization for Brazil
+# Author: Analysis Script
+# Date: 2025
+
+# Load necessary packages
+library(sf)           # For spatial data processing
+library(dplyr)        # For data manipulation
+library(ggplot2)      # For static visualizations
+library(leaflet)      # For interactive maps
+library(htmlwidgets)  # For saving interactive maps
+library(readr)        # For reading CSV files
+library(viridis)      # For continuous color palettes
+
+# Set locale to handle encoding issues
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+
+# Set working directory and create output folder
+output_dir <- "C:/Users/a1230/Desktop/temperature_visualization"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("========== Temperature Visualization ==========\n")
+
+#####################################
+## 1. Data Loading and Preparation
+#####################################
+
+cat("\n======= Loading Data =======\n")
+
+# Load temperature data with encoding handling
+temp_data_path <- "C:/Users/a1230/Desktop/基孔肯雅热/chikungunya_weather_population_merged.csv"
+
+# Try different encodings to handle multibyte characters
+tryCatch({
+  temp_data <- read_csv(temp_data_path, locale = locale(encoding = "UTF-8"))
+}, error = function(e1) {
+  cat("UTF-8 encoding failed, trying UTF-8-BOM...\n")
+  tryCatch({
+    temp_data <- read_csv(temp_data_path, locale = locale(encoding = "UTF-8-BOM"))
+  }, error = function(e2) {
+    cat("UTF-8-BOM encoding failed, trying latin1...\n")
+    tryCatch({
+      temp_data <- read_csv(temp_data_path, locale = locale(encoding = "latin1"))
+    }, error = function(e3) {
+      cat("All encodings failed, using base R read.csv with UTF-8...\n")
+      temp_data <- read.csv(temp_data_path, encoding = "UTF-8", stringsAsFactors = FALSE)
+    })
+  })
+})
+
+# If still failing, try without automatic type detection
+if(!exists("temp_data")) {
+  cat("Trying with all columns as character first...\n")
+  temp_data <- read_csv(temp_data_path, 
+                        locale = locale(encoding = "UTF-8"),
+                        col_types = cols(.default = "c"))
+}
+
+# Check if data loaded successfully
+if(exists("temp_data")) {
+  cat("Temperature data loaded successfully:", nrow(temp_data), "rows,", ncol(temp_data), "columns\n")
+  
+  # Clean column names to avoid encoding issues
+  colnames(temp_data) <- iconv(colnames(temp_data), to = "UTF-8", sub = "")
+  colnames(temp_data) <- gsub("[^[:alnum:]_]", "_", colnames(temp_data))
+  
+  cat("Column names:", paste(colnames(temp_data), collapse = ", "), "\n")
+} else {
+  stop("Failed to load temperature data. Please check file path and encoding.")
+}
+
+# Load Brazil administrative boundaries (ADM2 level) with encoding handling
+map_path <- "D:/巴西/bra_adm_ibge_2020_shp/bra_admbnda_adm2_ibge_2020.shp"
+
+tryCatch({
+  brazil_map <- st_read(map_path, quiet = TRUE, options = c("ENCODING=UTF-8"))
+}, error = function(e1) {
+  cat("UTF-8 encoding failed for shapefile, trying without encoding specification...\n")
+  tryCatch({
+    brazil_map <- st_read(map_path, quiet = TRUE)
+  }, error = function(e2) {
+    stop("Failed to load Brazil map. Please check file path: ", map_path)
+  })
+})
+
+cat("Brazil map loaded:", nrow(brazil_map), "administrative units\n")
+
+# Clean map column names
+colnames(brazil_map) <- iconv(colnames(brazil_map), to = "UTF-8", sub = "")
+colnames(brazil_map) <- gsub("[^[:alnum:]_]", "_", colnames(brazil_map))
+
+# Transform to WGS84 for leaflet compatibility
+if(st_crs(brazil_map)$input != "EPSG:4326") {
+  brazil_map <- st_transform(brazil_map, 4326)
+  cat("Map transformed to WGS84 (EPSG:4326)\n")
+}
+
+#####################################
+## 2. Data Processing and Aggregation
+#####################################
+
+cat("\n======= Temperature Data Processing =======\n")
+
+# Convert key columns from character to numeric
+temp_data <- temp_data %>%
+  mutate(
+    temperature_mean = as.numeric(temperature_mean),
+    year = as.numeric(year),
+    month = as.numeric(month),
+    cityid = as.character(cityid),
+    ADM2_PCODE = as.character(ADM2_PCODE)
+  )
+
+# Clean the temperature data
+temp_data_clean <- temp_data %>%
+  filter(!is.na(ADM2_PCODE), !is.na(temperature_mean), !is.na(year)) %>%
+  filter(year >= 2000, year <= 2030, !is.na(month), month >= 1, month <= 12)
+
+cat("After cleaning:", nrow(temp_data_clean), "rows retained\n")
+cat("Temperature range:", round(min(temp_data_clean$temperature_mean, na.rm = TRUE), 2), "°C to", 
+    round(max(temp_data_clean$temperature_mean, na.rm = TRUE), 2), "°C\n")
+
+# Calculate temperature statistics by municipality
+municipality_temp <- temp_data_clean %>%
+  group_by(ADM2_PCODE) %>%
+  summarise(
+    avg_temperature = mean(temperature_mean, na.rm = TRUE),
+    min_temperature = min(temperature_mean, na.rm = TRUE),
+    max_temperature = max(temperature_mean, na.rm = TRUE),
+    temp_range = max_temperature - min_temperature,
+    months_with_data = n_distinct(paste(year, month)),
+    years_with_data = n_distinct(year),
+    coldest_month = paste(year[which.min(temperature_mean)], 
+                         month[which.min(temperature_mean)], sep = "-")[1],
+    hottest_month = paste(year[which.max(temperature_mean)], 
+                         month[which.max(temperature_mean)], sep = "-")[1],
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(avg_temperature))
+
+cat("Temperature statistics calculated for", nrow(municipality_temp), "municipalities\n")
+
+#####################################
+## 3. Merge with Map Data
+#####################################
+
+cat("\n======= Merging with Map Data =======\n")
+
+# Merge municipality temperature data with map data
+brazil_map_temp <- brazil_map %>%
+  left_join(municipality_temp, by = "ADM2_PCODE") %>%
+  mutate(
+    avg_temperature = ifelse(is.na(avg_temperature), NA, avg_temperature)
+  )
+
+# Remove municipalities without temperature data for cleaner visualization
+brazil_map_temp_filtered <- brazil_map_temp %>%
+  filter(!is.na(avg_temperature))
+
+cat("Map data merged. Municipalities with temperature data:", nrow(brazil_map_temp_filtered), "\n")
+
+#####################################
+## 4. Static Temperature Map
+#####################################
+
+cat("\n======= Creating Static Temperature Map =======\n")
+
+# Create static temperature map with continuous color scale
+temperature_map <- ggplot(brazil_map_temp) +
+  geom_sf(aes(fill = avg_temperature), color = "white", size = 0.1) +
+  scale_fill_viridis_c(
+    name = "Average\nTemperature (°C)",
+    option = "plasma",
+    na.value = "grey90",
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 15,
+      barheight = 1.2
+    )
+  ) +
+  labs(
+    title = "Average Temperature by Municipality in Brazil",
+    subtitle = paste0("Study period: ", min(temp_data_clean$year), "-", max(temp_data_clean$year)),
+    caption = "Based on monthly temperature means. Grey areas indicate no data."
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    plot.caption = element_text(hjust = 0.5, size = 10),
+    legend.title = element_text(hjust = 0.5)
+  )
+
+# Save the temperature map
+ggsave(file.path(output_dir, "brazil_temperature_map.png"), 
+       temperature_map, width = 12, height = 10, dpi = 300)
+
+#####################################
+## 5. Interactive Leaflet Temperature Map
+#####################################
+
+cat("\n======= Creating Interactive Temperature Map =======\n")
+
+# Calculate map center
+map_center <- brazil_map_temp_filtered %>%
+  st_bbox() %>%
+  {c(lat = mean(c(.[2], .[4])), lng = mean(c(.[1], .[3])))}
+
+# Create color palette for continuous temperature values
+temp_range <- range(brazil_map_temp_filtered$avg_temperature, na.rm = TRUE)
+pal_temp <- colorNumeric(
+  palette = viridis::plasma(256),
+  domain = temp_range,
+  na.color = "transparent"
+)
+
+# Create interactive temperature map
+temp_leaflet <- leaflet(brazil_map_temp_filtered) %>%
+  addTiles() %>%
+  setView(lng = map_center["lng"], lat = map_center["lat"], zoom = 4) %>%
+  addPolygons(
+    fillColor = ~pal_temp(avg_temperature),
+    weight = 0.5,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    popup = ~paste0(
+      "<strong>ADM2_PCODE: </strong>", ADM2_PCODE, "<br/>",
+      "<strong>Average Temperature: </strong>", round(avg_temperature, 2), "°C<br/>",
+      "<strong>Temperature Range: </strong>", round(min_temperature, 2), "°C - ", round(max_temperature, 2), "°C<br/>",
+      "<strong>Temperature Variation: </strong>", round(temp_range, 2), "°C<br/>",
+      "<strong>Years with Data: </strong>", years_with_data, "<br/>",
+      "<strong>Months with Data: </strong>", months_with_data, "<br/>",
+      "<strong>Coldest Month: </strong>", coldest_month, " (", round(min_temperature, 2), "°C)<br/>",
+      "<strong>Hottest Month: </strong>", hottest_month, " (", round(max_temperature, 2), "°C)"
+    ),
+    label = ~paste0(ADM2_PCODE, ": ", round(avg_temperature, 1), "°C"),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "13px",
+      direction = "auto"
+    )
+  ) %>%
+  addLegend(
+    pal = pal_temp,
+    values = ~avg_temperature,
+    opacity = 0.8,
+    title = "Average Temperature (°C)",
+    position = "bottomright",
+    labFormat = labelFormat(suffix = "°C", digits = 1)
+  ) %>%
+  addControl(
+    html = "<h4>Average Temperature in Brazil</h4>
+            <p>Click on municipalities for detailed information</p>
+            <p>Based on monthly temperature means</p>",
+    position = "topright"
+  )
+
+# Save interactive temperature map
+saveWidget(temp_leaflet, 
+           file = file.path(output_dir, "brazil_temperature_interactive_map.html"),
+           selfcontained = TRUE)
+
+cat("Interactive temperature map saved as: brazil_temperature_interactive_map.html\n")
+
+#####################################
+## 6. Alternative Color Schemes
+#####################################
+
+cat("\n======= Creating Alternative Color Scheme Maps =======\n")
+
+# Create a map with different color scheme (cool to warm)
+temperature_map_alt <- ggplot(brazil_map_temp) +
+  geom_sf(aes(fill = avg_temperature), color = "white", size = 0.1) +
+  scale_fill_gradient2(
+    name = "Average\nTemperature (°C)",
+    low = "blue",
+    mid = "yellow",
+    high = "red",
+    midpoint = mean(range(brazil_map_temp$avg_temperature, na.rm = TRUE)),
+    na.value = "grey90",
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 15,
+      barheight = 1.2
+    )
+  ) +
+  labs(
+    title = "Average Temperature by Municipality in Brazil (Cool-Warm Scale)",
+    subtitle = paste0("Study period: ", min(temp_data_clean$year), "-", max(temp_data_clean$year)),
+    caption = "Blue = Cool, Yellow = Moderate, Red = Hot. Grey areas indicate no data."
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    plot.caption = element_text(hjust = 0.5, size = 10),
+    legend.title = element_text(hjust = 0.5)
+  )
+
+# Save the alternative temperature map
+ggsave(file.path(output_dir, "brazil_temperature_map_cool_warm.png"), 
+       temperature_map_alt, width = 12, height = 10, dpi = 300)
+
+# Create interactive map with alternative color scheme
+pal_temp_alt <- colorNumeric(
+  palette = c("blue", "cyan", "yellow", "orange", "red"),
+  domain = temp_range,
+  na.color = "transparent"
+)
+
+temp_leaflet_alt <- leaflet(brazil_map_temp_filtered) %>%
+  addTiles() %>%
+  setView(lng = map_center["lng"], lat = map_center["lat"], zoom = 4) %>%
+  addPolygons(
+    fillColor = ~pal_temp_alt(avg_temperature),
+    weight = 0.5,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    popup = ~paste0(
+      "<strong>ADM2_PCODE: </strong>", ADM2_PCODE, "<br/>",
+      "<strong>Average Temperature: </strong>", round(avg_temperature, 2), "°C<br/>",
+      "<strong>Temperature Range: </strong>", round(min_temperature, 2), "°C - ", round(max_temperature, 2), "°C<br/>",
+      "<strong>Temperature Variation: </strong>", round(temp_range, 2), "°C<br/>",
+      "<strong>Years with Data: </strong>", years_with_data, "<br/>",
+      "<strong>Months with Data: </strong>", months_with_data, "<br/>",
+      "<strong>Coldest Record: </strong>", coldest_month, " (", round(min_temperature, 2), "°C)<br/>",
+      "<strong>Hottest Record: </strong>", hottest_month, " (", round(max_temperature, 2), "°C)"
+    ),
+    label = ~paste0(ADM2_PCODE, ": ", round(avg_temperature, 1), "°C"),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "13px",
+      direction = "auto"
+    )
+  ) %>%
+  addLegend(
+    pal = pal_temp_alt,
+    values = ~avg_temperature,
+    opacity = 0.8,
+    title = "Average Temperature (°C)",
+    position = "bottomright",
+    labFormat = labelFormat(suffix = "°C", digits = 1)
+  ) %>%
+  addControl(
+    html = "<h4>Average Temperature in Brazil (Cool-Warm Scale)</h4>
+            <p>Click on municipalities for detailed information</p>
+            <p>Blue = Cool, Red = Hot</p>",
+    position = "topright"
+  )
+
+# Save alternative interactive temperature map
+saveWidget(temp_leaflet_alt, 
+           file = file.path(output_dir, "brazil_temperature_interactive_map_cool_warm.html"),
+           selfcontained = TRUE)
+
+#####################################
+## 7. Seasonal Temperature Maps
+#####################################
+
+cat("\n======= Creating Seasonal Temperature Maps =======\n")
+
+# Calculate seasonal averages
+seasonal_temp <- temp_data_clean %>%
+  mutate(
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "Summer",
+      month %in% c(3, 4, 5) ~ "Autumn", 
+      month %in% c(6, 7, 8) ~ "Winter",
+      month %in% c(9, 10, 11) ~ "Spring"
+    )
+  ) %>%
+  group_by(ADM2_PCODE, season) %>%
+  summarise(
+    seasonal_temp = mean(temperature_mean, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Create maps for each season
+seasons <- c("Summer", "Autumn", "Winter", "Spring")
+
+for(season_name in seasons) {
+  cat("Creating map for", season_name, "...\n")
+  
+  # Filter data for current season
+  season_data <- seasonal_temp %>%
+    filter(season == season_name)
+  
+  # Merge with map
+  brazil_map_season <- brazil_map %>%
+    left_join(season_data, by = "ADM2_PCODE")
+  
+  # Create static map
+  season_map <- ggplot(brazil_map_season) +
+    geom_sf(aes(fill = seasonal_temp), color = "white", size = 0.1) +
+    scale_fill_viridis_c(
+      name = "Temperature (°C)",
+      option = "plasma",
+      na.value = "grey90",
+      guide = guide_colorbar(
+        title.position = "top",
+        title.hjust = 0.5,
+        barwidth = 15,
+        barheight = 1.2
+      )
+    ) +
+    labs(
+      title = paste("Average", season_name, "Temperature by Municipality"),
+      subtitle = "Based on monthly temperature data",
+      caption = "Grey areas indicate no data."
+    ) +
+    theme_void() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 12),
+      plot.caption = element_text(hjust = 0.5, size = 10),
+      legend.title = element_text(hjust = 0.5)
+    )
+  
+  # Save seasonal map
+  ggsave(file.path(output_dir, paste0("brazil_temperature_", tolower(season_name), "_map.png")), 
+         season_map, width = 12, height = 10, dpi = 300)
+}
+
+#####################################
+## 8. Summary Statistics and Output
+#####################################
+
+cat("\n======= Summary Statistics =======\n")
+
+# Calculate summary statistics
+temp_summary <- municipality_temp %>%
+  summarise(
+    municipalities_with_data = n(),
+    overall_avg_temp = round(mean(avg_temperature, na.rm = TRUE), 2),
+    overall_min_temp = round(min(min_temperature, na.rm = TRUE), 2),
+    overall_max_temp = round(max(max_temperature, na.rm = TRUE), 2),
+    temp_std_dev = round(sd(avg_temperature, na.rm = TRUE), 2)
+  )
+
+cat("Summary Statistics:\n")
+cat("- Municipalities with data:", temp_summary$municipalities_with_data, "\n")
+cat("- Overall average temperature:", temp_summary$overall_avg_temp, "°C\n")
+cat("- Temperature range:", temp_summary$overall_min_temp, "°C to", temp_summary$overall_max_temp, "°C\n")
+cat("- Standard deviation:", temp_summary$temp_std_dev, "°C\n")
+
+# Find hottest and coldest municipalities
+hottest_municipality <- municipality_temp %>%
+  filter(avg_temperature == max(avg_temperature, na.rm = TRUE)) %>%
+  select(ADM2_PCODE, avg_temperature) %>%
+  slice(1)
+
+coldest_municipality <- municipality_temp %>%
+  filter(avg_temperature == min(avg_temperature, na.rm = TRUE)) %>%
+  select(ADM2_PCODE, avg_temperature) %>%
+  slice(1)
+
+cat("\nExtreme Temperatures:\n")
+cat("- Hottest municipality:", hottest_municipality$ADM2_PCODE, 
+    "(", round(hottest_municipality$avg_temperature, 2), "°C)\n")
+cat("- Coldest municipality:", coldest_municipality$ADM2_PCODE, 
+    "(", round(coldest_municipality$avg_temperature, 2), "°C)\n")
+
+#####################################
+## 9. Output Summary
+#####################################
+
+cat("\n========== Temperature Visualization Complete ==========\n")
+cat("Generated Files:\n")
+cat("1. brazil_temperature_map.png - Static temperature map (Plasma color scheme)\n")
+cat("2. brazil_temperature_map_cool_warm.png - Static temperature map (Cool-Warm color scheme)\n")
+cat("3. brazil_temperature_interactive_map.html - Interactive temperature map (Plasma)\n")
+cat("4. brazil_temperature_interactive_map_cool_warm.html - Interactive temperature map (Cool-Warm)\n")
+cat("5. brazil_temperature_summer_map.png - Summer temperature map\n")
+cat("6. brazil_temperature_autumn_map.png - Autumn temperature map\n")
+cat("7. brazil_temperature_winter_map.png - Winter temperature map\n")
+cat("8. brazil_temperature_spring_map.png - Spring temperature map\n\n")
+
+# Create temperature distribution summary
+temp_distribution <- municipality_temp %>%
+  mutate(
+    temp_category = case_when(
+      avg_temperature < 20 ~ "Cool (<20°C)",
+      avg_temperature < 25 ~ "Moderate (20-25°C)",
+      avg_temperature < 30 ~ "Warm (25-30°C)",
+      avg_temperature >= 30 ~ "Hot (≥30°C)"
+    )
+  ) %>%
+  count(temp_category) %>%
+  mutate(percentage = round(n / sum(n) * 100, 1))
+
+cat("Temperature Distribution by Category:\n")
+print(temp_distribution)
+
+cat("\n** Open the HTML files in a web browser for interactive exploration **\n")
+cat("** The continuous color scale shows temperature gradients smoothly **\n")
+cat("========== Analysis Complete ==========\n")

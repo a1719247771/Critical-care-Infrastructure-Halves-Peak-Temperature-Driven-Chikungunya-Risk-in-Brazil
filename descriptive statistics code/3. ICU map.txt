@@ -1,0 +1,489 @@
+# ICU Bed Availability Visualization for Brazil
+# Author: Analysis Script
+# Date: 2025
+
+# Load necessary packages
+library(sf)           # For spatial data processing
+library(dplyr)        # For data manipulation
+library(ggplot2)      # For static visualizations
+library(leaflet)      # For interactive maps
+library(htmlwidgets)  # For saving interactive maps
+library(readr)        # For reading CSV files
+
+# Set locale to handle encoding issues
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+
+# Set working directory and create output folder
+output_dir <- "C:/Users/a1230/Desktop/icu_visualization"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("========== ICU Bed Availability Visualization ==========\n")
+
+#####################################
+## 1. Data Loading and Preparation
+#####################################
+
+cat("\n======= Loading Data =======\n")
+
+# Load ICU data with encoding handling
+icu_data_path <- "C:/Users/a1230/Desktop/基孔肯雅热/chikungunya_weather_population_merged.csv"
+
+# Try different encodings to handle multibyte characters
+tryCatch({
+  icu_data <- read_csv(icu_data_path, locale = locale(encoding = "UTF-8"))
+}, error = function(e1) {
+  cat("UTF-8 encoding failed, trying UTF-8-BOM...\n")
+  tryCatch({
+    icu_data <- read_csv(icu_data_path, locale = locale(encoding = "UTF-8-BOM"))
+  }, error = function(e2) {
+    cat("UTF-8-BOM encoding failed, trying latin1...\n")
+    tryCatch({
+      icu_data <- read_csv(icu_data_path, locale = locale(encoding = "latin1"))
+    }, error = function(e3) {
+      cat("All encodings failed, using base R read.csv with UTF-8...\n")
+      icu_data <- read.csv(icu_data_path, encoding = "UTF-8", stringsAsFactors = FALSE)
+    })
+  })
+})
+
+# If still failing, try without automatic type detection
+if(!exists("icu_data")) {
+  cat("Trying with all columns as character first...\n")
+  icu_data <- read_csv(icu_data_path, 
+                       locale = locale(encoding = "UTF-8"),
+                       col_types = cols(.default = "c"))
+}
+
+# Check if data loaded successfully
+if(exists("icu_data")) {
+  cat("ICU data loaded successfully:", nrow(icu_data), "rows,", ncol(icu_data), "columns\n")
+  
+  # Clean column names to avoid encoding issues
+  colnames(icu_data) <- iconv(colnames(icu_data), to = "UTF-8", sub = "")
+  colnames(icu_data) <- gsub("[^[:alnum:]_]", "_", colnames(icu_data))
+  
+  cat("Column names:", paste(colnames(icu_data), collapse = ", "), "\n")
+} else {
+  stop("Failed to load ICU data. Please check file path and encoding.")
+}
+
+# Load Brazil administrative boundaries (ADM2 level) with encoding handling
+map_path <- "D:/巴西/bra_adm_ibge_2020_shp/bra_admbnda_adm2_ibge_2020.shp"
+
+tryCatch({
+  brazil_map <- st_read(map_path, quiet = TRUE, options = c("ENCODING=UTF-8"))
+}, error = function(e1) {
+  cat("UTF-8 encoding failed for shapefile, trying without encoding specification...\n")
+  tryCatch({
+    brazil_map <- st_read(map_path, quiet = TRUE)
+  }, error = function(e2) {
+    stop("Failed to load Brazil map. Please check file path: ", map_path)
+  })
+})
+
+cat("Brazil map loaded:", nrow(brazil_map), "administrative units\n")
+
+# Clean map column names
+colnames(brazil_map) <- iconv(colnames(brazil_map), to = "UTF-8", sub = "")
+colnames(brazil_map) <- gsub("[^[:alnum:]_]", "_", colnames(brazil_map))
+
+# Transform to WGS84 for leaflet compatibility
+if(st_crs(brazil_map)$input != "EPSG:4326") {
+  brazil_map <- st_transform(brazil_map, 4326)
+  cat("Map transformed to WGS84 (EPSG:4326)\n")
+}
+
+#####################################
+## 2. ICU Data Processing and Binary Classification
+#####################################
+
+cat("\n======= ICU Data Processing and Binary Classification =======\n")
+
+# Convert key columns from character to numeric
+icu_data <- icu_data %>%
+  mutate(
+    ICU = as.numeric(ICU),
+    year = as.numeric(year),
+    month = as.numeric(month),
+    cityid = as.character(cityid),
+    ADM2_PCODE = as.character(ADM2_PCODE)
+  )
+
+# Clean the ICU data
+icu_data_clean <- icu_data %>%
+  filter(!is.na(ADM2_PCODE), !is.na(ICU), !is.na(year)) %>%
+  filter(year >= 2000, year <= 2030, !is.na(month), month >= 1, month <= 12) %>%
+  filter(ICU >= 0)  # Remove negative values if any
+
+cat("After cleaning:", nrow(icu_data_clean), "rows retained\n")
+cat("ICU bed range:", min(icu_data_clean$ICU, na.rm = TRUE), "to", 
+    max(icu_data_clean$ICU, na.rm = TRUE), "beds\n")
+
+# Perform binary classification and calculate ICU statistics by municipality
+municipality_icu <- icu_data_clean %>%
+  group_by(ADM2_PCODE) %>%
+  summarise(
+    total_icu_beds = sum(ICU, na.rm = TRUE),
+    avg_icu_beds = mean(ICU, na.rm = TRUE),
+    max_icu_beds = max(ICU, na.rm = TRUE),
+    min_icu_beds = min(ICU, na.rm = TRUE),
+    months_with_icu = sum(ICU > 0, na.rm = TRUE),
+    months_total = n(),
+    months_without_icu = sum(ICU == 0, na.rm = TRUE),
+    years_with_data = n_distinct(year),
+    # Binary classification: Has ICU if any month has ICU > 0
+    has_icu = ifelse(max(ICU, na.rm = TRUE) > 0, "Has ICU", "No ICU"),
+    # Calculate ICU availability percentage
+    icu_availability_pct = round((months_with_icu / months_total) * 100, 1),
+    # Peak ICU month
+    peak_icu_month = paste(year[which.max(ICU)], month[which.max(ICU)], sep = "-")[1],
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(avg_icu_beds))
+
+cat("ICU binary classification completed for", nrow(municipality_icu), "municipalities\n")
+
+# Show distribution of ICU availability
+icu_distribution <- municipality_icu %>%
+  count(has_icu) %>%
+  mutate(percentage = round(n / sum(n) * 100, 1))
+
+cat("\nICU Availability Distribution:\n")
+print(icu_distribution)
+
+#####################################
+## 3. Merge with Map Data
+#####################################
+
+cat("\n======= Merging with Map Data =======\n")
+
+# Merge municipality ICU data with map data
+brazil_map_icu <- brazil_map %>%
+  left_join(municipality_icu, by = "ADM2_PCODE") %>%
+  mutate(
+    has_icu = ifelse(is.na(has_icu), "No Data", has_icu),
+    has_icu = factor(has_icu, levels = c("Has ICU", "No ICU", "No Data"))
+  )
+
+cat("Map data merged successfully\n")
+
+#####################################
+## 4. Create Beautiful ICU Availability Map
+#####################################
+
+cat("\n======= Creating ICU Availability Map with Attractive Colors =======\n")
+
+# Create ICU availability map with attractive color palette
+icu_map <- ggplot(brazil_map_icu) +
+  geom_sf(aes(fill = has_icu), color = "white", size = 0.1) +
+  scale_fill_manual(
+    values = c("Has ICU" = "#2E8B57",        # Sea Green - professional and calming
+               "No ICU" = "#FF6B6B",          # Coral Red - warm but not alarming
+               "No Data" = "#E8E8E8"),        # Light Grey - neutral
+    name = "ICU Bed Status",
+    guide = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      nrow = 1,
+      override.aes = list(size = 0.5)
+    )
+  ) +
+  labs(
+    title = "ICU Bed Availability Across Brazilian Municipalities",
+    subtitle = paste0("Study Period: ", min(icu_data_clean$year), "-", max(icu_data_clean$year)),
+    caption = "Green = ICU beds available • Red = No ICU beds • Grey = No data available"
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(
+      hjust = 0.5, 
+      face = "bold", 
+      size = 16,
+      color = "#2C3E50",
+      margin = margin(b = 5)
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5, 
+      size = 12,
+      color = "#34495E",
+      margin = margin(b = 15)
+    ),
+    plot.caption = element_text(
+      hjust = 0.5, 
+      size = 10,
+      color = "#7F8C8D",
+      margin = margin(t = 10)
+    ),
+    legend.title = element_text(
+      hjust = 0.5,
+      size = 12,
+      face = "bold",
+      color = "#2C3E50"
+    ),
+    legend.text = element_text(
+      size = 10,
+      color = "#34495E"
+    ),
+    panel.background = element_rect(fill = "#F8F9FA", color = NA),
+    plot.background = element_rect(fill = "#F8F9FA", color = NA),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+# Save the ICU availability map
+ggsave(file.path(output_dir, "brazil_icu_availability_map_english.png"), 
+       icu_map, width = 14, height = 11, dpi = 300, bg = "#F8F9FA")
+
+cat("Beautiful ICU availability map saved as: brazil_icu_availability_map_english.png\n")
+
+#####################################
+## 5. Interactive Leaflet ICU Map
+#####################################
+
+cat("\n======= Creating Interactive ICU Availability Map =======\n")
+
+# Calculate map center
+map_center <- brazil_map_icu %>%
+  st_bbox() %>%
+  {c(lat = mean(c(.[2], .[4])), lng = mean(c(.[1], .[3])))}
+
+# Create color palette for binary ICU classification
+icu_colors <- c("Has ICU" = "#2E8B57",     # Sea Green
+                "No ICU" = "#FF6B6B",      # Coral Red
+                "No Data" = "#E8E8E8")     # Light Grey
+
+pal_icu <- colorFactor(
+  palette = icu_colors,
+  domain = brazil_map_icu$has_icu,
+  na.color = "transparent"
+)
+
+# Create interactive ICU availability map
+icu_leaflet <- leaflet(brazil_map_icu) %>%
+  addTiles() %>%
+  setView(lng = map_center["lng"], lat = map_center["lat"], zoom = 4) %>%
+  addPolygons(
+    fillColor = ~pal_icu(has_icu),
+    weight = 0.5,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    popup = ~paste0(
+      "<div style='font-family: Arial, sans-serif;'>",
+      "<h4 style='margin: 0 0 10px 0; color: #2C3E50;'>", ADM2_PCODE, "</h4>",
+      "<hr style='margin: 5px 0;'>",
+      "<strong>ICU Status:</strong> ", has_icu, "<br/>",
+      "<strong>Average ICU Beds:</strong> ", ifelse(is.na(avg_icu_beds), "No data", round(avg_icu_beds, 1)), "<br/>",
+      "<strong>Maximum ICU Beds:</strong> ", ifelse(is.na(max_icu_beds), "No data", max_icu_beds), "<br/>",
+      "<strong>Total ICU Beds:</strong> ", ifelse(is.na(total_icu_beds), "No data", total_icu_beds), "<br/>",
+      "<strong>Months with ICU:</strong> ", ifelse(is.na(months_with_icu), "No data", months_with_icu), "<br/>",
+      "<strong>Total Months:</strong> ", ifelse(is.na(months_total), "No data", months_total), "<br/>",
+      "<strong>ICU Availability:</strong> ", ifelse(is.na(icu_availability_pct), "No data", paste0(icu_availability_pct, "%")), "<br/>",
+      "<strong>Peak ICU Month:</strong> ", ifelse(is.na(peak_icu_month), "No data", peak_icu_month),
+      "</div>"
+    ),
+    label = ~paste0(ADM2_PCODE, ": ", has_icu),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px", 
+                   "background-color" = "rgba(255,255,255,0.9)",
+                   "border" = "1px solid #ccc",
+                   "border-radius" = "3px"),
+      textsize = "13px",
+      direction = "auto"
+    )
+  ) %>%
+  addLegend(
+    pal = pal_icu,
+    values = ~has_icu,
+    opacity = 0.8,
+    title = "ICU Bed Status",
+    position = "bottomright",
+    labFormat = labelFormat(prefix = "")
+  ) %>%
+  addControl(
+    html = "<div style='background: rgba(255,255,255,0.9); padding: 10px; border-radius: 5px; border: 1px solid #ccc;'>
+            <h4 style='margin: 0 0 5px 0; color: #2C3E50;'>Brazil ICU Bed Distribution</h4>
+            <p style='margin: 0; font-size: 12px;'>Click on municipalities for detailed information</p>
+            <p style='margin: 0; font-size: 11px; color: #666;'>
+            <span style='color: #2E8B57;'>●</span> Has ICU beds &nbsp;
+            <span style='color: #FF6B6B;'>●</span> No ICU beds &nbsp;
+            <span style='color: #E8E8E8;'>●</span> No data
+            </p>
+            </div>",
+    position = "topright"
+  )
+
+# Save interactive ICU map
+saveWidget(icu_leaflet, 
+           file = file.path(output_dir, "brazil_icu_interactive_map_english.html"),
+           selfcontained = TRUE)
+
+cat("Interactive ICU map saved as: brazil_icu_interactive_map_english.html\n")
+
+#####################################
+## 6. Interactive ICU Density Map
+#####################################
+
+cat("\n======= Creating Interactive ICU Density Map =======\n")
+
+# Filter out municipalities with no ICU data for density map
+brazil_map_icu_density <- brazil_map_icu %>%
+  filter(!is.na(avg_icu_beds), avg_icu_beds > 0)
+
+# Create color palette for continuous ICU bed numbers
+if(nrow(brazil_map_icu_density) > 0) {
+  icu_range <- range(brazil_map_icu_density$avg_icu_beds, na.rm = TRUE)
+  pal_icu_density <- colorNumeric(
+    palette = c("#E8F5E8", "#B8E6B8", "#66C266", "#2E8B57", "#1F5F3F"),
+    domain = icu_range,
+    na.color = "transparent"
+  )
+  
+  # Create interactive ICU density map
+  icu_density_leaflet <- leaflet(brazil_map_icu) %>%
+    addTiles() %>%
+    setView(lng = map_center["lng"], lat = map_center["lat"], zoom = 4) %>%
+    # Add municipalities without ICU in coral
+    addPolygons(
+      data = brazil_map_icu %>% filter(has_icu == "No ICU"),
+      fillColor = "#FF6B6B",
+      weight = 0.5,
+      opacity = 1,
+      color = "white",
+      dashArray = "3",
+      fillOpacity = 0.6,
+      popup = ~paste0(
+        "<div style='font-family: Arial, sans-serif;'>",
+        "<h4 style='margin: 0 0 10px 0; color: #2C3E50;'>", ADM2_PCODE, "</h4>",
+        "<hr style='margin: 5px 0;'>",
+        "<strong>ICU Status:</strong> ", has_icu,
+        "</div>"
+      ),
+      label = ~paste0(ADM2_PCODE, ": No ICU beds"),
+      group = "No ICU Beds"
+    ) %>%
+    # Add municipalities with ICU with density colors
+    addPolygons(
+      data = brazil_map_icu_density,
+      fillColor = ~pal_icu_density(avg_icu_beds),
+      weight = 0.5,
+      opacity = 1,
+      color = "white",
+      dashArray = "3",
+      fillOpacity = 0.8,
+      highlight = highlightOptions(
+        weight = 2,
+        color = "#666",
+        dashArray = "",
+        fillOpacity = 0.9,
+        bringToFront = TRUE
+      ),
+      popup = ~paste0(
+        "<div style='font-family: Arial, sans-serif;'>",
+        "<h4 style='margin: 0 0 10px 0; color: #2C3E50;'>", ADM2_PCODE, "</h4>",
+        "<hr style='margin: 5px 0;'>",
+        "<strong>Average ICU Beds:</strong> ", round(avg_icu_beds, 1), "<br/>",
+        "<strong>Maximum ICU Beds:</strong> ", max_icu_beds, "<br/>",
+        "<strong>Minimum ICU Beds:</strong> ", min_icu_beds, "<br/>",
+        "<strong>Total ICU Beds:</strong> ", total_icu_beds, "<br/>",
+        "<strong>Months with ICU:</strong> ", months_with_icu, " / ", months_total, "<br/>",
+        "<strong>ICU Availability:</strong> ", icu_availability_pct, "%<br/>",
+        "<strong>Peak Month:</strong> ", peak_icu_month, " (", max_icu_beds, " beds)",
+        "</div>"
+      ),
+      label = ~paste0(ADM2_PCODE, ": ", round(avg_icu_beds, 1), " beds"),
+      labelOptions = labelOptions(
+        style = list("font-weight" = "normal", padding = "3px 8px",
+                     "background-color" = "rgba(255,255,255,0.9)",
+                     "border" = "1px solid #ccc",
+                     "border-radius" = "3px"),
+        textsize = "13px",
+        direction = "auto"
+      ),
+      group = "Has ICU Beds"
+    ) %>%
+    addLegend(
+      pal = pal_icu_density,
+      values = brazil_map_icu_density$avg_icu_beds,
+      opacity = 0.8,
+      title = "Average ICU Beds",
+      position = "bottomright"
+    ) %>%
+    addLayersControl(
+      overlayGroups = c("Has ICU Beds", "No ICU Beds"),
+      options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+    addControl(
+      html = "<div style='background: rgba(255,255,255,0.9); padding: 10px; border-radius: 5px; border: 1px solid #ccc;'>
+              <h4 style='margin: 0 0 5px 0; color: #2C3E50;'>Brazil ICU Bed Density</h4>
+              <p style='margin: 0; font-size: 12px;'>Click for detailed ICU bed information</p>
+              <p style='margin: 0; font-size: 11px; color: #666;'>Toggle layers to show/hide areas</p>
+              </div>",
+      position = "topright"
+    )
+  
+  # Save interactive ICU density map
+  saveWidget(icu_density_leaflet, 
+             file = file.path(output_dir, "brazil_icu_density_interactive_map_english.html"),
+             selfcontained = TRUE)
+  
+  cat("Interactive ICU density map saved as: brazil_icu_density_interactive_map_english.html\n")
+} else {
+  cat("No municipalities with ICU density data found. Skipping density map.\n")
+}
+
+#####################################
+## 7. Summary Statistics
+#####################################
+
+cat("\n======= Summary Statistics =======\n")
+
+# Calculate comprehensive ICU statistics
+icu_summary <- municipality_icu %>%
+  summarise(
+    total_municipalities = n(),
+    municipalities_with_icu = sum(has_icu == "Has ICU", na.rm = TRUE),
+    municipalities_without_icu = sum(has_icu == "No ICU", na.rm = TRUE),
+    icu_coverage_rate = round((municipalities_with_icu / total_municipalities) * 100, 1),
+    total_icu_beds_all = sum(total_icu_beds, na.rm = TRUE),
+    avg_icu_beds_overall = round(mean(avg_icu_beds, na.rm = TRUE), 2),
+    max_icu_beds_municipality = max(max_icu_beds, na.rm = TRUE),
+    min_icu_beds_municipality = min(avg_icu_beds[avg_icu_beds > 0], na.rm = TRUE)
+  )
+
+cat("Overall ICU Service Statistics:\n")
+cat("- Total Municipalities:", icu_summary$total_municipalities, "\n")
+cat("- Municipalities with ICU:", icu_summary$municipalities_with_icu, "\n")
+cat("- Municipalities without ICU:", icu_summary$municipalities_without_icu, "\n")
+cat("- ICU Coverage Rate:", icu_summary$icu_coverage_rate, "%\n")
+cat("- Total ICU Beds:", icu_summary$total_icu_beds_all, "\n")
+cat("- Overall Average ICU Beds:", icu_summary$avg_icu_beds_overall, "\n")
+cat("- Maximum ICU Beds (single municipality):", icu_summary$max_icu_beds_municipality, "\n")
+cat("- Minimum ICU Beds (municipalities with ICU):", round(icu_summary$min_icu_beds_municipality, 2), "\n")
+
+# Find top ICU municipalities
+top_icu_municipalities <- municipality_icu %>%
+  filter(has_icu == "Has ICU") %>%
+  arrange(desc(avg_icu_beds)) %>%
+  head(10) %>%
+  select(ADM2_PCODE, avg_icu_beds, max_icu_beds, icu_availability_pct)
+
+cat("\nTop 10 Municipalities by ICU Bed Count:\n")
+print(top_icu_municipalities)
+
+cat("\n========== ICU Visualization Complete ==========\n")
+cat("Generated Files:\n")
+cat("1. brazil_icu_availability_map_english.png - Static ICU availability map\n")
+cat("2. brazil_icu_interactive_map_english.html - Interactive ICU availability map\n")
+cat("3. brazil_icu_density_interactive_map_english.html - Interactive ICU density map\n")
+cat("\n** Beautiful maps with professional color scheme **\n")
+cat("** Green = ICU beds available, Red = No ICU beds available **\n")
+cat("** Open HTML files in browser for interactive exploration **\n")

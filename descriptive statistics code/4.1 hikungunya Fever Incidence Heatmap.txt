@@ -1,0 +1,509 @@
+# Chikungunya Fever Time Series Visualization - Enhanced Version
+# Author: Analysis Script
+# Date: 2025
+
+# Clear environment and load packages
+rm(list = ls())
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+library(gridExtra)
+library(viridis)
+library(RColorBrewer)
+library(data.table)
+
+# Set output directory
+output_dir <- "C:/Users/a1230/Desktop/chikungunya_enhanced_analysis"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("========== Chikungunya Fever Enhanced Time Series Analysis ==========\n")
+
+#####################################
+## 1. Data Loading and Preprocessing
+#####################################
+
+cat("\n======= Loading Data =======\n")
+
+# Read data - Fix encoding issues
+data_path <- "C:/Users/a1230/Desktop/基孔肯雅热/chikungunya_weather_population_merged.csv"
+
+# Try multiple encoding methods to read data
+chik_data <- tryCatch({
+  # First try UTF-8
+  read_csv(data_path, locale = locale(encoding = "UTF-8"))
+}, error = function(e1) {
+  cat("UTF-8 encoding failed, trying UTF-8-BOM...\n")
+  tryCatch({
+    read_csv(data_path, locale = locale(encoding = "UTF-8-BOM"))
+  }, error = function(e2) {
+    cat("UTF-8-BOM encoding failed, trying GBK...\n")
+    tryCatch({
+      read_csv(data_path, locale = locale(encoding = "GBK"))
+    }, error = function(e3) {
+      cat("GBK encoding failed, trying latin1...\n")
+      tryCatch({
+        read_csv(data_path, locale = locale(encoding = "latin1"))
+      }, error = function(e4) {
+        cat("All encodings failed, using base R read...\n")
+        # Use base R read.csv as last resort
+        read.csv(data_path, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+      })
+    })
+  })
+})
+
+# If still failed, try to specify all columns as character type
+if(!exists("chik_data") || nrow(chik_data) == 0) {
+  cat("Trying to read all columns as character type...\n")
+  chik_data <- read_csv(data_path, 
+                        locale = locale(encoding = "UTF-8"),
+                        col_types = cols(.default = "c"))
+}
+
+# Check if data loaded successfully
+if(exists("chik_data") && nrow(chik_data) > 0) {
+  cat("Data loaded successfully:", nrow(chik_data), "rows", ncol(chik_data), "columns\n")
+  
+  # Clean column names, remove possible special characters
+  colnames(chik_data) <- iconv(colnames(chik_data), to = "UTF-8", sub = "")
+  colnames(chik_data) <- gsub("[^[:alnum:]_]", "_", colnames(chik_data))
+  
+  cat("Column names:", paste(colnames(chik_data)[1:min(10, ncol(chik_data))], collapse = ", "), "...\n")
+} else {
+  stop("Unable to load data file, please check file path and encoding")
+}
+
+# Data cleaning - Enhanced version
+chik_data_clean <- chik_data %>%
+  # Safely convert numeric columns
+  mutate(
+    Y = suppressWarnings(as.numeric(as.character(Y))),
+    year = suppressWarnings(as.integer(as.character(year))),
+    month = suppressWarnings(as.integer(as.character(month))),
+    temperature_mean = suppressWarnings(as.numeric(as.character(temperature_mean))),
+    temp_max_mean = suppressWarnings(as.numeric(as.character(temp_max_mean))),
+    temp_min_mean = suppressWarnings(as.numeric(as.character(temp_min_mean))),
+    humidity_mean = suppressWarnings(as.numeric(as.character(humidity_mean))),
+    rainfall_mean = suppressWarnings(as.numeric(as.character(rainfall_mean)))
+  ) %>%
+  # Create date variable (using safe method)
+  mutate(
+    date = tryCatch({
+      as.Date(paste(year, month, "01", sep = "-"))
+    }, error = function(e) {
+      as.Date(paste(ifelse(is.na(year), 2015, year), 
+                    ifelse(is.na(month), 1, month), "01", sep = "-"))
+    })
+  ) %>%
+  # Filter data
+  filter(
+    !is.na(Y), !is.na(date), Y >= 0,
+    year >= 2010, year <= 2025,
+    !is.na(temperature_mean),
+    month >= 1, month <= 12
+  ) %>%
+  # Handle missing values
+  mutate(Y = ifelse(is.na(Y), 0, Y))
+
+# Check cleaned data
+cat("After data cleaning:", nrow(chik_data_clean), "rows retained\n")
+if(nrow(chik_data_clean) > 0) {
+  cat("Y column statistics:\n")
+  print(summary(chik_data_clean$Y))
+  cat("Temperature column statistics:\n") 
+  print(summary(chik_data_clean$temperature_mean))
+} else {
+  stop("No valid data after cleaning, please check data format")
+}
+
+# Aggregate data by month - Safe version
+monthly_data <- chik_data_clean %>%
+  # Ensure data validity
+  filter(!is.na(year), !is.na(month), !is.na(date)) %>%
+  group_by(year, month, date) %>%
+  summarise(
+    total_cases = sum(Y, na.rm = TRUE),
+    avg_temp = mean(temperature_mean, na.rm = TRUE),
+    avg_temp_max = mean(temp_max_mean, na.rm = TRUE),
+    avg_temp_min = mean(temp_min_mean, na.rm = TRUE),
+    avg_humidity = mean(humidity_mean, na.rm = TRUE),
+    avg_rainfall = mean(rainfall_mean, na.rm = TRUE),
+    records_count = n(),
+    .groups = 'drop'
+  ) %>%
+  # Filter out invalid aggregated data
+  filter(
+    !is.na(total_cases), 
+    !is.na(avg_temp),
+    records_count > 0
+  ) %>%
+  arrange(date)
+
+# Check monthly data
+if(nrow(monthly_data) > 0) {
+  cat("Monthly data aggregation completed:", nrow(monthly_data), "monthly data points\n")
+  cat("Time range:", as.character(min(monthly_data$date)), "to", as.character(max(monthly_data$date)), "\n")
+  cat("Total cases:", format(sum(monthly_data$total_cases, na.rm = TRUE), big.mark = ","), "\n")
+  cat("Temperature range:", round(min(monthly_data$avg_temp, na.rm = TRUE), 1), "°C to", 
+      round(max(monthly_data$avg_temp, na.rm = TRUE), 1), "°C\n")
+} else {
+  stop("Monthly data aggregation failed, please check raw data")
+}
+
+#####################################
+## 2. Chart 1: Enhanced Time Series Trend Plot
+#####################################
+
+cat("\n======= Creating Enhanced Time Series Trend Plot =======\n")
+
+# Using gradient colors and modern design
+p1 <- ggplot(monthly_data, aes(x = date)) +
+  # Background gradient effect
+  geom_ribbon(aes(ymin = 0, ymax = total_cases), 
+              fill = "#FF6B6B", alpha = 0.2) +
+  # Bar chart - using gradient colors
+  geom_col(aes(y = total_cases), 
+           fill = "#FF6B6B", alpha = 0.8, width = 20) +
+  # Smooth trend line - using contrasting color
+  geom_smooth(aes(y = total_cases), 
+              method = "loess", span = 0.2, se = TRUE,
+              color = "#4ECDC4", linewidth = 2.5,
+              fill = "#4ECDC4", alpha = 0.15) +
+  # Annual separator lines
+  geom_vline(xintercept = as.Date(paste(seq(2011, 2024, 1), "01", "01", sep = "-")),
+             linetype = "dotted", color = "white", alpha = 0.6, linewidth = 0.5) +
+  labs(
+    title = "Chikungunya Fever Monthly Incidence Time Series (2010-2024)",
+    subtitle = "Red bars: Monthly cases | Cyan line: Long-term trend",
+    x = "Time",
+    y = "Monthly Cases",
+    caption = "Data source: Brazil Chikungunya fever surveillance data"
+  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(labels = comma_format(), 
+                     expand = expansion(mult = c(0, 0.05))) +
+  theme_minimal() +
+  theme(
+    # Background and panels
+    plot.background = element_rect(fill = "#F8F9FA", color = NA),
+    panel.background = element_rect(fill = "#FFFFFF", color = NA),
+    panel.grid.major = element_line(color = "#E8E9EA", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    
+    # Text styles
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5, 
+                              color = "#2C3E50", margin = margin(t = 20, b = 10)),
+    plot.subtitle = element_text(size = 13, hjust = 0.5, color = "#7F8C8D",
+                                 margin = margin(b = 20)),
+    axis.title = element_text(size = 14, face = "bold", color = "#34495E"),
+    axis.text = element_text(size = 12, color = "#2C3E50"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.caption = element_text(size = 10, hjust = 1, color = "#95A5A6",
+                                margin = margin(t = 15)),
+    
+    # Margins
+    plot.margin = margin(25, 25, 25, 25)
+  )
+
+#####################################
+## 3. Chart 2: Enhanced Heatmap (without value labels)
+#####################################
+
+cat("\n======= Creating Enhanced Heatmap =======\n")
+
+# Prepare heatmap data - Log transformation but legend shows actual values
+heatmap_data <- monthly_data %>%
+  # Ensure data completeness
+  filter(!is.na(year), !is.na(month), !is.na(total_cases)) %>%
+  mutate(
+    # Month order should be consistent with regular calendar (top to bottom: Jan to Dec)
+    month_name = factor(month.abb[month], levels = month.abb),
+    # Use log transformation for color mapping, but keep original values for legend
+    log_cases = log10(total_cases + 1),  # Log transformation
+    original_cases = total_cases         # Keep original values
+  )
+
+# Check heatmap data
+cat("Heatmap data check:\n")
+cat("Data rows:", nrow(heatmap_data), "\n")
+cat("Year range:", min(heatmap_data$year), "-", max(heatmap_data$year), "\n")
+cat("Cases range:", min(heatmap_data$total_cases), "-", max(heatmap_data$total_cases), "\n")
+
+# Create custom legend labels (actual values)
+# Create reasonable actual value labels based on log range
+log_breaks <- seq(0, ceiling(max(heatmap_data$log_cases, na.rm = TRUE)), length.out = 6)
+actual_breaks <- 10^log_breaks - 1
+actual_breaks[1] <- 0  # Set first value to 0
+
+# Use log transformation but legend shows actual values
+p2 <- ggplot(heatmap_data, aes(x = factor(year), y = month_name, fill = log_cases)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  # Use log-transformed data for color mapping
+  scale_fill_viridis_c(
+    name = "Cases",
+    option = "inferno",  # Keep high contrast
+    na.value = "gray95",
+    # Custom legend: log scale but show actual values
+    breaks = log_breaks,
+    labels = function(x) {
+      actual_values <- 10^x - 1
+      actual_values[actual_values < 1] <- 0
+      comma_format()(round(actual_values))
+    },
+    guide = guide_colorbar(
+      barwidth = 25,   # Increase legend width
+      barheight = 2,   # Increase legend height
+      title.position = "top", 
+      title.hjust = 0.5,
+      frame.colour = "black",
+      ticks.colour = "black"
+    )
+  ) +
+  labs(
+    title = "Chikungunya Fever Incidence Heatmap (by Year and Month)",
+    subtitle = "Color intensity represents incidence level",
+    x = "Year",
+    y = "Month"
+  ) +
+  theme_minimal() +
+  theme(
+    # Background
+    plot.background = element_rect(fill = "#F8F9FA", color = NA),
+    panel.background = element_rect(fill = "#FFFFFF", color = NA),
+    panel.grid = element_blank(),
+    
+    # Text styles
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5, 
+                              color = "#2C3E50", margin = margin(t = 20, b = 10)),
+    plot.subtitle = element_text(size = 13, hjust = 0.5, color = "#7F8C8D",
+                                 margin = margin(b = 20)),
+    axis.title = element_text(size = 14, face = "bold", color = "#34495E"),
+    axis.text = element_text(size = 12, color = "#2C3E50"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    
+    # Legend - larger and clearer
+    legend.position = "bottom",
+    legend.title = element_text(size = 14, face = "bold", color = "#34495E"),
+    legend.text = element_text(size = 11, color = "#2C3E50"),
+    legend.margin = margin(t = 25),
+    
+    # Margins
+    plot.margin = margin(25, 25, 25, 25)
+  )
+
+#####################################
+## 4. Chart 3: Enhanced Temperature Relationship Plot (non-standardized)
+#####################################
+
+cat("\n======= Creating Enhanced Temperature Relationship Plot =======\n")
+
+# Create clean temperature relationship plot (only 3 main lines)
+cat("Creating simplified temperature relationship plot...\n")
+
+# Method: Standardize for comparison but only show 3 main lines
+temp_data_long <- monthly_data %>%
+  select(date, total_cases, avg_temp, avg_temp_max) %>%
+  # Standardize for comparison
+  mutate(
+    cases_norm = scale(total_cases)[,1],
+    temp_norm = scale(avg_temp)[,1],
+    temp_max_norm = scale(avg_temp_max)[,1]
+  ) %>%
+  # Convert to long format
+  tidyr::pivot_longer(
+    cols = c(cases_norm, temp_norm, temp_max_norm),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    variable_label = case_when(
+      variable == "cases_norm" ~ "Cases",
+      variable == "temp_norm" ~ "Avg Temperature",
+      variable == "temp_max_norm" ~ "Max Temperature"
+    ),
+    variable_label = factor(variable_label, 
+                            levels = c("Cases", "Avg Temperature", "Max Temperature"))
+  )
+
+p3 <- ggplot(temp_data_long, aes(x = date, y = value, color = variable_label)) +
+  # Only clean lines, no smooth lines
+  geom_line(linewidth = 1.8, alpha = 0.9) +
+  scale_color_manual(
+    name = "",
+    values = c("Cases" = "#FF6B6B", 
+               "Avg Temperature" = "#4ECDC4", 
+               "Max Temperature" = "#45B7D1")
+  ) +
+  labs(
+    title = "Chikungunya Fever Cases vs Temperature Standardized Comparison",
+    subtitle = "Three lines showing relationship between cases and temperature",
+    x = "Time",
+    y = "Standardized Values",
+    caption = "All indicators standardized (mean=0, sd=1) for trend comparison"
+  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  theme_minimal() +
+  theme(
+    # Background
+    plot.background = element_rect(fill = "#F8F9FA", color = NA),
+    panel.background = element_rect(fill = "#FFFFFF", color = NA),
+    panel.grid.major = element_line(color = "#E8E9EA", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    
+    # Text styles
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5, 
+                              color = "#2C3E50", margin = margin(t = 20, b = 10)),
+    plot.subtitle = element_text(size = 13, hjust = 0.5, color = "#7F8C8D",
+                                 margin = margin(b = 20)),
+    axis.title = element_text(size = 14, face = "bold", color = "#34495E"),
+    axis.text = element_text(size = 12, color = "#2C3E50"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    
+    # Legend
+    legend.position = "bottom",
+    legend.text = element_text(size = 12, color = "#2C3E50"),
+    legend.margin = margin(t = 15),
+    legend.key.width = unit(2, "cm"),
+    
+    plot.caption = element_text(size = 10, hjust = 1, color = "#95A5A6",
+                                margin = margin(t = 15)),
+    
+    # Margins
+    plot.margin = margin(25, 25, 25, 25)
+  )
+
+#####################################
+## 5. Save Enhanced Charts
+#####################################
+
+cat("\n======= Saving Enhanced Charts =======\n")
+
+# Create combined chart - with error handling
+tryCatch({
+  combined_main <- grid.arrange(p1, p2, ncol = 1, heights = c(1.8, 1.2))
+  cat("Combined chart created successfully\n")
+}, error = function(e) {
+  cat("Combined chart creation failed:", e$message, "\n")
+})
+
+# Save individual charts separately
+cat("Starting to save charts...\n")
+
+# Save time series plot
+tryCatch({
+  ggsave(file.path(output_dir, "1_timeseries_beautiful.png"), 
+         p1, width = 16, height = 8, dpi = 300)
+  cat("✓ Time series plot saved successfully\n")
+}, error = function(e) {
+  cat("✗ Time series plot save failed:", e$message, "\n")
+})
+
+# Save heatmap
+tryCatch({
+  ggsave(file.path(output_dir, "2_heatmap_beautiful.png"), 
+         p2, width = 14, height = 8, dpi = 300)
+  cat("✓ Heatmap saved successfully\n")
+}, error = function(e) {
+  cat("✗ Heatmap save failed:", e$message, "\n")
+})
+
+# Try to save combined chart
+if(exists("combined_main")) {
+  tryCatch({
+    ggsave(file.path(output_dir, "chikungunya_timeseries_enhanced.png"), 
+           combined_main, width = 16, height = 14, dpi = 300)
+    cat("✓ Combined chart saved successfully\n")
+  }, error = function(e) {
+    cat("✗ Combined chart save failed:", e$message, "\n")
+  })
+}
+
+# Save temperature relationship plot - with more robust error handling
+tryCatch({
+  ggsave(file.path(output_dir, "3_temperature_beautiful.png"), 
+         p3, width = 16, height = 9, dpi = 300)
+  cat("✓ Dual-axis temperature plot saved successfully\n")
+}, error = function(e) {
+  cat("✗ Dual-axis temperature plot save failed:", e$message, "\n")
+  cat("Creating simplified version...\n")
+  
+  # Create simplified temperature relationship plot, not using dual axis
+  p3_simple <- ggplot(monthly_data, aes(x = date)) +
+    geom_ribbon(aes(ymin = 0, ymax = total_cases), 
+                fill = "#FF6B6B", alpha = 0.3) +
+    geom_line(aes(y = total_cases), color = "#FF6B6B", linewidth = 1.8) +
+    labs(
+      title = "Chikungunya Fever Case Time Series",
+      subtitle = "Monthly case trend",
+      x = "Time", 
+      y = "Monthly Cases"
+    ) +
+    scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+    scale_y_continuous(labels = comma_format()) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.margin = margin(25, 25, 25, 25)
+    )
+  
+  ggsave(file.path(output_dir, "3_temperature_simple.png"), 
+         p3_simple, width = 16, height = 8, dpi = 300)
+  cat("✓ Simplified temperature plot saved\n")
+})
+
+# Save individual plots
+ggsave(file.path(output_dir, "1_timeseries_beautiful.png"), 
+       p1, width = 16, height = 8, dpi = 300)
+
+ggsave(file.path(output_dir, "2_heatmap_beautiful.png"), 
+       p2, width = 14, height = 8, dpi = 300)
+
+ggsave(file.path(output_dir, "3_temperature_beautiful.png"), 
+       p3, width = 16, height = 8, dpi = 300)
+
+#####################################
+## 6. Generate Summary Report
+#####################################
+
+cat("\n======= Generating Analysis Report =======\n")
+
+# Calculate key statistical indicators
+peak_month <- monthly_data[which.max(monthly_data$total_cases), ]
+correlation_temp <- cor(monthly_data$total_cases, monthly_data$avg_temp, use = "complete.obs")
+correlation_temp_max <- cor(monthly_data$total_cases, monthly_data$avg_temp_max, use = "complete.obs")
+
+report <- paste0(
+  "Chikungunya Fever Enhanced Time Series Analysis Report\n",
+  "==================================================\n\n",
+  "Data Overview:\n",
+  "- Analysis period: ", as.character(min(monthly_data$date)), " to ", as.character(max(monthly_data$date)), "\n",
+  "- Total cases: ", format(sum(monthly_data$total_cases, na.rm = TRUE), big.mark = ","), "\n",
+  "- Monthly data points: ", nrow(monthly_data), "\n\n",
+  
+  "Key Findings:\n",
+  "- Peak incidence: ", peak_month$year, " Year ", peak_month$month, " Month (",
+  format(peak_month$total_cases, big.mark = ","), " cases)\n",
+  "- Correlation with average temperature: ", round(correlation_temp, 3), "\n",
+  "- Correlation with maximum temperature: ", round(correlation_temp_max, 3), "\n\n",
+  
+  "Enhancement Features:\n",
+  "- Modern gradient color schemes\n",
+  "- Heatmap without value labels for pure color expression\n",
+  "- Temperature relationship plot using dual axis showing real values\n",
+  "- Unified visual style and color scheme\n\n",
+  
+  "Generated Files:\n",
+  "1. Main combined chart: chikungunya_timeseries_enhanced.png\n",
+  "2. Temperature relationship chart: chikungunya_temperature_enhanced.png\n",
+  "3. Individual charts: 1_timeseries_beautiful.png, 2_heatmap_beautiful.png, 3_temperature_beautiful.png\n\n"
+)
+
+writeLines(report, file.path(output_dir, "enhanced_analysis_report.txt"))
+cat(report)
+
+cat("\n======= Enhanced Analysis Complete =======\n")
+cat("All enhanced charts saved to:", output_dir, "\n")
+cat("Main improvements: Modern colors, removed heatmap values, real temperature display, unified design style\n")
