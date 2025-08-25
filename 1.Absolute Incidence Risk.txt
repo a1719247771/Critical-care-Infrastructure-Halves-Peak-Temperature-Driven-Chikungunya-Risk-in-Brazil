@@ -1,0 +1,642 @@
+library(fixest)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+
+##############################################################
+# Helper function: Add transparency
+##############################################################
+add.alpha <- function(col, alpha=1) {
+  apply(sapply(col, col2rgb)/255, 2, 
+        function(x) rgb(x[1], x[2], x[3], alpha))
+}
+
+##############################################################
+# 1. Estimate centered quadratic model (detailed results version)
+##############################################################
+
+estimate_temp_quadratic_model_centered <- function(data, reference_temp = 18.0) {
+  
+  cat("\n=== Estimating Temperature Quadratic Model (Reference:", reference_temp, "°C) ===\n")
+  
+  # Create centered temperature variables - key step!
+  data$temperature_centered <- data$temperature_mean - reference_temp
+  data$temperature_centered_sq <- data$temperature_centered^2
+  
+  cat("Temperature centering completed, reference point:", reference_temp, "°C\n")
+  cat("Centered temperature range:", 
+      round(range(data$temperature_centered, na.rm = TRUE), 1), "\n")
+  
+  # Basic control variables
+  control_vars <- c("humidity_mean", "pressure_mean", "wind_speed_mean", 
+                    "temperature_centered", "temperature_centered_sq")
+  
+  # Add all control variables directly (no individual checking)
+  additional_vars <- c("ICU", "hospital", "log_pop_density", "forest", "farming", "urban")
+  control_vars <- c(control_vars, additional_vars)
+  
+  cat("Included control variables:", paste(control_vars, collapse = ", "), "\n")
+  
+  # Build model formula
+  formula_str <- paste("cases ~", paste(control_vars, collapse = " + "), "| cityid + year_month")
+  
+  cat("Quadratic model formula (centered version):\n")
+  cat(formula_str, "\n")
+  
+  # Estimate model
+  if("log_population" %in% names(data)) {
+    model <- fepois(as.formula(formula_str), 
+                    offset = ~log_population, 
+                    data = data)
+  } else {
+    model <- fepois(as.formula(formula_str), 
+                    data = data)
+  }
+  
+  cat("Centered quadratic model estimation completed\n")
+  
+  # ===== Print detailed quadratic model results =====
+  cat("\n=== Centered Quadratic Model Detailed Results ===\n")
+  
+  # Print model summary
+  print(summary(model))
+  
+  # Extract and print temperature-related coefficients
+  cat("\n=== Temperature-Related Coefficient Details ===\n")
+  model_coef <- coef(model)
+  model_se <- se(model)
+  
+  # Find temperature-related coefficients
+  temp_coef_names <- c("temperature_centered", "temperature_centered_sq")
+  temp_coef_names <- temp_coef_names[temp_coef_names %in% names(model_coef)]
+  
+  if(length(temp_coef_names) > 0) {
+    temp_results <- data.frame(
+      Variable = temp_coef_names,
+      Coefficient = round(model_coef[temp_coef_names], 6),  # Higher precision display
+      Std_Error = round(model_se[temp_coef_names], 6),
+      t_value = round(model_coef[temp_coef_names] / model_se[temp_coef_names], 3),
+      p_value = round(2 * (1 - pnorm(abs(model_coef[temp_coef_names] / model_se[temp_coef_names]))), 4),
+      row.names = NULL
+    )
+    print(temp_results)
+    
+    # Calculate turning point (if quadratic coefficient exists)
+    if("temperature_centered_sq" %in% temp_coef_names && "temperature_centered" %in% temp_coef_names) {
+      temp_linear_coef <- model_coef["temperature_centered"]
+      temp_quad_coef <- model_coef["temperature_centered_sq"]
+      
+      if(!is.na(temp_quad_coef) && temp_quad_coef != 0) {
+        turning_point_centered <- -temp_linear_coef / (2 * temp_quad_coef)
+        turning_point_actual <- turning_point_centered + reference_temp
+        
+        cat("\n=== Turning Point Analysis ===\n")
+        cat("Turning point on centered scale:", round(turning_point_centered, 3), "\n")
+        cat("Actual temperature turning point:", round(turning_point_actual, 2), "°C\n")
+        
+        # Determine turning point nature
+        if(temp_quad_coef > 0) {
+          cat("Turning point nature: Minimum point (U-shaped curve)\n")
+        } else {
+          cat("Turning point nature: Maximum point (Inverted U-shaped curve)\n")
+        }
+        
+        # Turning point position relative to reference point
+        if(abs(turning_point_centered) < 0.5) {
+          cat("Turning point position: Close to reference temperature\n")
+        } else if(turning_point_centered > 0) {
+          cat("Turning point position: Above reference temperature by", round(turning_point_centered, 1), "°C\n")
+        } else {
+          cat("Turning point position: Below reference temperature by", round(-turning_point_centered, 1), "°C\n")
+        }
+      } else {
+        cat("\n=== Turning Point Analysis ===\n")
+        cat("No turning point (quadratic coefficient is 0 or near 0)\n")
+      }
+    }
+  }
+  
+  # Print model fit statistics
+  cat("\n=== Model Fit Statistics ===\n")
+  cat("AIC:", round(AIC(model), 2), "\n")
+  cat("BIC:", round(BIC(model), 2), "\n")
+  cat("Log-likelihood:", round(as.numeric(logLik(model)), 2), "\n")
+  cat("Number of observations:", nobs(model), "\n")
+  
+  # Print other control variable coefficients
+  cat("\n=== Main Control Variable Coefficients ===\n")
+  main_controls <- c("humidity_mean", "pressure_mean", "wind_speed_mean")
+  control_coef_names <- names(model_coef)[names(model_coef) %in% main_controls]
+  
+  if(length(control_coef_names) > 0) {
+    control_results <- data.frame(
+      Variable = control_coef_names,
+      Coefficient = round(model_coef[control_coef_names], 4),
+      Std_Error = round(model_se[control_coef_names], 4),
+      t_value = round(model_coef[control_coef_names] / model_se[control_coef_names], 3),
+      row.names = NULL
+    )
+    print(control_results)
+  }
+  
+  # Verification at reference point
+  cat("\n=== Reference Point Verification ===\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("At reference point (T-T_ref=0):\n")
+  cat("  Linear term contribution: 0 * β1 = 0\n")
+  cat("  Quadratic term contribution: 0² * β2 = 0\n")
+  cat("  Total contribution: 0 (relative risk ratio should be 1.0)\n")
+  
+  cat("\n=== Centered Quadratic Model Results Output Completed ===\n")
+  
+  return(model)
+}
+
+##############################################################
+# 2. Calculate absolute risk (exposure-response curve)
+##############################################################
+
+calculate_absolute_risk <- function(model, temp_range, data, reference_temp = 18.0, n_points = 100) {
+  
+  cat("\n=== Calculating Absolute Risk (Exposure-Response Curve) ===\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  
+  # Get coefficients
+  coef_est <- coef(model)
+  
+  # Check if temperature coefficients exist
+  if(!"temperature_centered" %in% names(coef_est)) {
+    stop("temperature_centered coefficient not found in model")
+  }
+  if(!"temperature_centered_sq" %in% names(coef_est)) {
+    stop("temperature_centered_sq coefficient not found in model")
+  }
+  
+  temp_linear_coef <- coef_est["temperature_centered"]
+  temp_quad_coef <- coef_est["temperature_centered_sq"]
+  
+  cat("Centered temperature linear coefficient (β1):", temp_linear_coef, "\n")
+  cat("Centered temperature quadratic coefficient (β2):", temp_quad_coef, "\n")
+  
+  # Create temperature sequence
+  temp_seq <- seq(temp_range[1], temp_range[2], length.out = n_points)
+  temp_seq_centered <- temp_seq - reference_temp  # Centering
+  
+  # Set "standard scenario": fix all control variables at sample means
+  cat("\n=== Setting Standard Scenario (Control Variables Fixed at Means) ===\n")
+  
+  # Create a standard observation with all control variables at their means
+  standard_scenario <- data.frame(
+    temperature_centered = temp_seq_centered,
+    temperature_centered_sq = temp_seq_centered^2
+  )
+  
+  # Add means of other control variables
+  control_vars <- c("humidity_mean", "pressure_mean", "wind_speed_mean", 
+                    "ICU", "hospital", "log_pop_density", "forest", "farming", "urban")
+  
+  for(var in control_vars) {
+    if(var %in% names(data) && var %in% names(coef_est)) {
+      mean_val <- mean(data[[var]], na.rm = TRUE)
+      standard_scenario[[var]] <- mean_val
+      cat(sprintf("%s fixed at mean: %.3f\n", var, mean_val))
+    }
+  }
+  
+  # Calculate absolute risk (incidence rate)
+  # Note: This calculates the linear prediction without fixed effects
+  linear_pred <- 0  # Initialize
+  
+  # Add temperature terms
+  linear_pred <- linear_pred + temp_linear_coef * temp_seq_centered + 
+    temp_quad_coef * temp_seq_centered^2
+  
+  # Add other control variable terms
+  for(var in names(standard_scenario)) {
+    if(var %in% names(coef_est) && !grepl("temperature", var)) {
+      linear_pred <- linear_pred + coef_est[var] * standard_scenario[[var]]
+    }
+  }
+  
+  # Calculate absolute incidence rate
+  # Here we assume a baseline incidence rate (can be adjusted based on actual data)
+  # To get meaningful absolute values, we use the observed average incidence rate as baseline
+  if("cases" %in% names(data) && "log_population" %in% names(data)) {
+    # Calculate average incidence rate in sample (per 100,000 person-months)
+    observed_rate <- mean(data$cases / exp(data$log_population) * 100000, na.rm = TRUE)
+    cat("Observed average incidence rate:", round(observed_rate, 2), "cases/100,000 person-months\n")
+    
+    # Use predicted value at reference temperature as baseline, adjust to observed incidence rate level
+    ref_idx <- which.min(abs(temp_seq - reference_temp))
+    baseline_adjustment <- log(observed_rate) - linear_pred[ref_idx]
+    
+    # Adjusted absolute incidence rate
+    absolute_rate <- exp(linear_pred + baseline_adjustment)
+  } else {
+    # If no population data, use relative scale
+    absolute_rate <- exp(linear_pred)
+    cat("Note: Using relative scale due to lack of population data\n")
+  }
+  
+  # Calculate turning point
+  if(!is.na(temp_quad_coef) && temp_quad_coef != 0) {
+    turning_point_centered <- -temp_linear_coef / (2 * temp_quad_coef)
+    turning_point_actual <- turning_point_centered + reference_temp
+    cat("Turning point temperature:", round(turning_point_actual, 2), "°C\n")
+  } else {
+    turning_point_actual <- NA
+  }
+  
+  results <- data.frame(
+    temperature = temp_seq,
+    temperature_centered = temp_seq_centered,
+    linear_prediction = linear_pred,
+    absolute_rate = absolute_rate,
+    turning_point = turning_point_actual,
+    reference_temp = reference_temp
+  )
+  
+  cat("Absolute risk calculation completed\n")
+  
+  return(results)
+}
+
+##############################################################
+# 3. Plot absolute risk stratified chart (top: risk curve, bottom: temperature distribution)
+##############################################################
+
+plot_absolute_risk_with_distribution <- function(absolute_results, temp_data, data, title_suffix = "", 
+                                                 save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  turning_point <- unique(absolute_results$turning_point)[1]
+  reference_temp <- unique(absolute_results$reference_temp)[1]
+  
+  # Define color scheme - consistent fresh blue tones with PM2.5 version
+  main_line_color <- "#3377bb"       # Medium blue main line (consistent with relative risk)
+  hist_fill_color <- "#99ccee"       # Light blue (consistent with relative risk)
+  grid_color <- "#e6e6e6"            # Light gray grid lines
+  text_color <- "#333333"            # Dark gray text
+  
+  # Reference line colors - consistent with first version
+  cold_color <- "#8ecae6"            # Cold line - blue
+  hot_color <- "#ffb5c2"             # Hot line - pink
+  
+  # Calculate 1% and 99% percentiles as reference lines
+  temp_p1 <- quantile(temp_data, 0.01, na.rm = TRUE)
+  temp_p99 <- quantile(temp_data, 0.99, na.rm = TRUE)
+  
+  # Determine chart size and layout parameters - golden ratio
+  layout_heights <- c(0.618, 0.382)  # Golden ratio
+  
+  # Create PNG image
+  png_file <- file.path(save_path, paste0("temperature_absolute_risk_distribution", title_suffix, ".png"))
+  png(filename = png_file, width = 10, height = 8, units = "in", res = 300)
+  
+  # Set layout
+  layout(matrix(c(1,2), nrow = 2, byrow = TRUE), heights = layout_heights)
+  
+  # Set plot parameters - top plot
+  par(mar = c(0, 5, 4, 2), cex.axis = 1.1, cex.lab = 1.2, family = "sans")
+  
+  # Top plot: Temperature effect on chikungunya absolute risk
+  # Automatically determine Y-axis units and range
+  max_rate <- max(absolute_results$absolute_rate, na.rm = TRUE)
+  min_rate <- min(absolute_results$absolute_rate, na.rm = TRUE)
+  
+  if(max_rate > 10) {
+    y_label <- "Incidence Rate (cases/100,000/month)"
+    rate_multiplier <- 1
+  } else {
+    y_label <- "Relative Incidence Rate"
+    rate_multiplier <- 1
+  }
+  
+  # Adjust Y-axis range to ensure complete data coverage
+  y_min <- min_rate * 0.9
+  y_max <- max_rate * 1.2
+  
+  plot(absolute_results$temperature, absolute_results$absolute_rate, type = 'n', 
+       ylim = c(y_min, y_max),
+       xlim = range(absolute_results$temperature),
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # Add grid lines
+  temp_breaks <- pretty(absolute_results$temperature, n = 8)
+  y_breaks <- pretty(c(y_min, y_max), n = 6)
+  
+  abline(h = y_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  abline(v = temp_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  
+  # Add reference lines
+  abline(v = reference_temp, col = "gray20", lty = 1, lwd = 2)  # Reference temperature line
+  abline(v = temp_p1, col = cold_color, lty = 2, lwd = 1.5)     # 1% percentile - blue
+  abline(v = temp_p99, col = hot_color, lty = 2, lwd = 1.5)     # 99% percentile - pink
+  
+  # Draw main curve
+  lines(absolute_results$temperature, absolute_results$absolute_rate, lwd = 2.5, col = main_line_color)
+  
+  # Add reference point marker
+  ref_idx <- which.min(abs(absolute_results$temperature - reference_temp))
+  points(absolute_results$temperature[ref_idx], absolute_results$absolute_rate[ref_idx], 
+         col = "gray20", pch = 19, cex = 1.5)
+  
+  # Add turning point marker (if exists)
+  if(!is.na(turning_point)) {
+    tp_idx <- which.min(abs(absolute_results$temperature - turning_point))
+    points(absolute_results$temperature[tp_idx], absolute_results$absolute_rate[tp_idx], 
+           col = "red", pch = 17, cex = 1.5)
+  }
+  
+  # Add Y-axis
+  axis(2, at = y_breaks, labels = round(y_breaks, 1), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext(y_label, side = 2, line = 3.5, cex = 1.2, col = text_color)
+  
+  # Add title
+  main_title <- paste0("Temperature Effect on Chikungunya Absolute Incidence Risk")
+  mtext(main_title, side = 3, line = 1, cex = 1.5, font = 2, col = text_color)
+  
+  # Bottom plot: Temperature frequency distribution histogram
+  par(mar = c(4.5, 5, 0.5, 2))
+  
+  # Filter temperature data to display range
+  temp_filtered <- temp_data[temp_data >= min(absolute_results$temperature) & 
+                               temp_data <= max(absolute_results$temperature)]
+  
+  # Create histogram intervals
+  actual_min <- min(temp_filtered, na.rm = TRUE)
+  actual_max <- max(temp_filtered, na.rm = TRUE)
+  buffer <- 0.1
+  safe_min <- floor(actual_min - buffer)
+  safe_max <- ceiling(actual_max + buffer)
+  
+  hist_breaks <- seq(safe_min, safe_max, by = 1)
+  if (max(hist_breaks) < safe_max) {
+    hist_breaks <- c(hist_breaks, safe_max)
+  }
+  
+  # Create histogram
+  hist_result <- hist(temp_filtered, breaks = hist_breaks, plot = FALSE)
+  hist_percent <- hist_result$counts / sum(hist_result$counts) * 100
+  
+  # Draw histogram background
+  plot(1, 1, type = "n", 
+       xlim = range(absolute_results$temperature), 
+       ylim = c(0, max(hist_percent) * 1.2), 
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # Add bar chart
+  for(i in 1:length(hist_percent)) {
+    if(hist_breaks[i] <= max(absolute_results$temperature) && 
+       hist_breaks[i+1] >= min(absolute_results$temperature)) {
+      rect(hist_breaks[i], 0, hist_breaks[i+1], hist_percent[i], 
+           col = add.alpha(hist_fill_color, 0.7), 
+           border = add.alpha("gray80", 0.5))
+    }
+  }
+  
+  # Add axes
+  axis(1, at = temp_breaks, labels = temp_breaks, col.axis = text_color, col = "gray70")
+  mtext("Temperature (°C)", side = 1, line = 3, cex = 1.2, col = text_color)
+  
+  # Add temperature reference lines
+  abline(v = reference_temp, col = "gray20", lty = 1, lwd = 2)  # Reference temperature line
+  abline(v = temp_p1, col = cold_color, lty = 2, lwd = 1.5)     # 1% percentile - blue
+  abline(v = temp_p99, col = hot_color, lty = 2, lwd = 1.5)     # 99% percentile - pink
+  
+  # Add mean line
+  temp_mean <- mean(temp_filtered, na.rm = TRUE)
+  abline(v = temp_mean, col = "gray30", lty = 1, lwd = 1.5)
+  
+  # Add Y-axis
+  y_ticks <- pretty(c(0, max(hist_percent)), n = 5)
+  axis(2, at = y_ticks, labels = paste0(format(y_ticks, digits = 1), "%"), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Sample Distribution\nFrequency (%)", side = 2, line = 2.8, cex = 1.2, col = text_color)
+  
+  # Add statistical information annotations
+  text(temp_mean, max(hist_percent) * 0.9, 
+       sprintf("Mean: %.1f°C", temp_mean), 
+       cex = 0.9, col = text_color)
+  
+  text(temp_p1, max(hist_percent) * 0.7, 
+       sprintf("P1: %.1f°C", temp_p1), 
+       cex = 0.9, col = cold_color)
+  
+  text(temp_p99, max(hist_percent) * 0.7, 
+       sprintf("P99: %.1f°C", temp_p99), 
+       cex = 0.9, col = hot_color)
+  
+  # Add border
+  box(col = "gray70")
+  
+  dev.off()
+  
+  cat("Absolute risk stratified chart saved to:", png_file, "\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("1% percentile:", round(temp_p1, 1), "°C\n")
+  cat("99% percentile:", round(temp_p99, 1), "°C\n")
+  
+  return(png_file)
+}
+
+##############################################################
+# 4. Data checking function
+##############################################################
+
+check_data_requirements_simple <- function(data) {
+  
+  cat("=== Data Requirements Check ===\n")
+  
+  required_vars <- c("temperature_mean", "cases", 
+                     "humidity_mean", "pressure_mean", "wind_speed_mean",
+                     "cityid", "year_month", "log_population")
+  
+  missing_vars <- required_vars[!required_vars %in% names(data)]
+  
+  if(length(missing_vars) > 0) {
+    cat("Missing variables:", paste(missing_vars, collapse = ", "), "\n")
+    cat("Please ensure data contains all the above variables\n")
+    return(FALSE)
+  }
+  
+  cat("✓ All required variables present\n")
+  
+  # Check temperature range
+  temp_range <- range(data$temperature_mean, na.rm = TRUE)
+  cat("Temperature range:", round(temp_range[1], 1), "to", round(temp_range[2], 1), "°C\n")
+  
+  cat("Data check completed\n\n")
+  return(TRUE)
+}
+
+##############################################################
+# 5. Main analysis function (absolute risk with distribution plot version)
+##############################################################
+
+run_absolute_risk_analysis_with_distribution <- function(data_clean, reference_temp = 18.0, 
+                                                         centering_method = "reference",
+                                                         save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("=== Starting Absolute Risk Analysis (with Temperature Distribution Plot) ===\n")
+  cat("Data rows:", nrow(data_clean), "\n")
+  cat("Centering method:", centering_method, "\n")
+  cat("Image save path:", save_path, "\n")
+  
+  # Ensure save path exists
+  if(!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+    cat("Created save path:", save_path, "\n")
+  }
+  
+  # Determine centering reference point
+  if(centering_method == "mean") {
+    actual_reference <- mean(data_clean$temperature_mean, na.rm = TRUE)
+    cat("Using mean centering, reference point:", round(actual_reference, 1), "°C\n")
+  } else {
+    actual_reference <- reference_temp
+    cat("Using specified reference point:", round(actual_reference, 1), "°C\n")
+  }
+  
+  # Display complete temperature range
+  temp_range <- range(data_clean$temperature_mean, na.rm = TRUE)
+  cat("Complete temperature range:", round(temp_range[1], 1), "to", round(temp_range[2], 1), "°C\n")
+  
+  # Step 1: Estimate centered quadratic model
+  model_quadratic <- estimate_temp_quadratic_model_centered(data_clean, actual_reference)
+  
+  # Step 2: Calculate absolute risk (exposure-response curve)
+  abs_risk <- calculate_absolute_risk(model_quadratic, temp_range, data_clean, actual_reference)
+  
+  # Step 3: Create stratified plot (absolute risk curve + temperature distribution)
+  plot_file <- plot_absolute_risk_with_distribution(
+    absolute_results = abs_risk,
+    temp_data = data_clean$temperature_mean,
+    data = data_clean,
+    title_suffix = "_improved",
+    save_path = save_path
+  )
+  
+  # Temperature range analysis
+  cat("\n=== Complete Temperature Range Analysis ===\n")
+  cat("Data covers temperature range:", round(temp_range[1], 1), "°C to", round(temp_range[2], 1), "°C\n")
+  cat("Temperature span:", round(temp_range[2] - temp_range[1], 1), "°C\n")
+  
+  # Extreme temperature risks
+  low_temp_idx <- which.min(abs_risk$temperature)
+  high_temp_idx <- which.max(abs_risk$temperature)
+  ref_temp_idx <- which.min(abs(abs_risk$temperature - actual_reference))
+  
+  cat("Absolute incidence rate at lowest temperature", round(abs_risk$temperature[low_temp_idx], 1), "°C:", 
+      round(abs_risk$absolute_rate[low_temp_idx], 2), "\n")
+  cat("Absolute incidence rate at reference temperature", round(actual_reference, 1), "°C:", 
+      round(abs_risk$absolute_rate[ref_temp_idx], 2), "\n")
+  cat("Absolute incidence rate at highest temperature", round(abs_risk$temperature[high_temp_idx], 1), "°C:", 
+      round(abs_risk$absolute_rate[high_temp_idx], 2), "\n")
+  
+  # Risk variation analysis
+  risk_range <- range(abs_risk$absolute_rate)
+  cat("\n=== Absolute Risk Variation Analysis ===\n")
+  cat("Absolute incidence rate range:", round(risk_range[1], 2), "to", round(risk_range[2], 2), "\n")
+  cat("Absolute incidence rate fold change:", round(risk_range[2] / risk_range[1], 2), "times\n")
+  
+  # Return results
+  return(list(
+    model_quadratic = model_quadratic,
+    absolute_risk = abs_risk,
+    plot_file = plot_file,
+    reference_temp = actual_reference,
+    data_complete = data_clean,
+    centering_method = centering_method,
+    temperature_range = temp_range,
+    save_path = save_path
+  ))
+}
+
+##############################################################
+# 6. Usage example (absolute risk version)
+##############################################################
+
+# Main analysis function call example
+if(exists("data_clean")) {
+  
+  cat("=== data_clean dataset detected ===\n")
+  
+  # Data check
+  if(check_data_requirements_simple(data_clean)) {
+    
+    # Run absolute risk analysis (with distribution plot)
+    cat("Starting absolute risk analysis (with temperature distribution plot)...\n")
+    results_absolute <- run_absolute_risk_analysis_with_distribution(
+      data_clean, 
+      reference_temp = 18.0,  # Reference temperature changed to 18°C
+      centering_method = "reference",  # Reference point centering
+      save_path = "C:/Users/a1230/Desktop/picture"  # Image save path
+    )
+    
+    cat("\n=== Absolute Risk Analysis Completed ===\n")
+    cat("Available results:\n")
+    cat("- results_absolute$model_quadratic: Centered quadratic model object\n")
+    cat("- results_absolute$absolute_risk: Absolute risk prediction results\n")
+    cat("- results_absolute$plot_file: Saved image file path\n")
+    cat("- results_absolute$temperature_range: Complete temperature range\n")
+    
+  } else {
+    cat("Data check failed, please check data format\n")
+  }
+  
+} else {
+  
+  cat("=== Usage Instructions (Absolute Risk with Distribution Plot Version) ===\n")
+  cat("Please prepare data_clean dataset first, containing the following variables:\n\n")
+  cat("Required variables:\n")
+  cat("- temperature_mean: Mean temperature\n")
+  cat("- cases: Case count\n")
+  cat("- humidity_mean: Mean humidity\n")
+  cat("- pressure_mean: Mean pressure\n")
+  cat("- wind_speed_mean: Mean wind speed\n")
+  cat("- cityid: City ID\n")
+  cat("- year_month: Year-month\n")
+  cat("- log_population: Population logarithm\n\n")
+  
+  cat("Usage:\n")
+  cat("# Check data\n")
+  cat("check_data_requirements_simple(data_clean)\n\n")
+  cat("# Run absolute risk analysis (with distribution plot)\n")
+  cat("results_absolute <- run_absolute_risk_analysis_with_distribution(\n")
+  cat("  data_clean,\n")
+  cat("  reference_temp = 18.0,  # Reference temperature changed to 18°C\n")
+  cat("  centering_method = 'reference',  # Reference point centering\n")
+  cat("  save_path = 'C:/Users/a1230/Desktop/picture'  # Image save path\n")
+  cat(")\n\n")
+  
+}
+
+cat("\n=== Absolute Risk Version Features ===\n")
+cat("1. ✅ Stratified layout - Top: absolute risk curve, Bottom: temperature distribution histogram\n")
+cat("2. ✅ Fresh blue color scheme, consistent with PM2.5 version\n")
+cat("3. ✅ Reference temperature changed to 18°C\n")
+cat("4. ✅ Blue dashed line indicates 1% percentile temperature\n")
+cat("5. ✅ Pink dashed line indicates 99% percentile temperature\n")
+cat("6. ✅ Black solid line indicates reference temperature\n")
+cat("7. ✅ Automatic Y-axis unit determination (incidence rate vs relative incidence rate)\n")
+cat("8. ✅ Complete statistical information annotations\n")
+
+cat("\n=== Absolute Risk Image Output ===\n")
+cat("Save path: C:/Users/a1230/Desktop/picture/\n")
+cat("Filename: temperature_absolute_risk_distribution_improved.png\n")
+cat("Format: High-resolution PNG (300dpi, 10x8 inches)\n")
+cat("Content: Absolute incidence risk curve + Temperature frequency distribution\n")
+
+cat("\n=== Absolute Risk vs Relative Risk Comparison ===\n")
+cat("📊 Relative Risk Plot (Blue series):\n")
+cat("   - Shows risk fold changes relative to reference temperature\n")
+cat("   - Y-axis on logarithmic scale, suitable for comparing risk ratios\n")
+cat("   - RR=1.0 at reference temperature\n\n")
+cat("📈 Absolute Risk Plot (Blue series):\n")
+cat("   - Shows actual incidence rate levels\n")
+cat("   - Y-axis on linear scale, suitable for assessing disease burden\n")
+cat("   - Provides specific incidence rate values\n")
+cat("   - Uses fresh blue color scheme consistent with relative risk\n")
+
+cat("\n=== Absolute Risk Analysis Code Ready ===\n")

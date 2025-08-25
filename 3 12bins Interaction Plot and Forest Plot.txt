@@ -1,0 +1,1048 @@
+# Enhanced Temperature Binning Model - ICU Interaction Effect Analysis (V5.0)
+# 12-bin version: Added forest plot visualization for better display of each temperature interval effect
+# Includes both layered plots and forest plots for comprehensive visualization
+
+library(fixest)
+library(ggplot2)
+library(dplyr)
+
+##############################################################
+# Helper function: Add transparency
+##############################################################
+add.alpha <- function(col, alpha=1) {
+  apply(sapply(col, col2rgb)/255, 2, 
+        function(x) rgb(x[1], x[2], x[3], alpha))
+}
+
+##############################################################
+# Data filtering function - Only remove data outside 1% and 99% percentiles
+##############################################################
+filter_extreme_temperatures <- function(data) {
+  
+  cat("\n=== Filtering Extreme Temperature Data (Outside 1% and 99% Percentiles) ===\n")
+  
+  # Calculate 1% and 99% percentiles
+  temp_p1 <- quantile(data$temperature_mean, 0.01, na.rm = TRUE)
+  temp_p99 <- quantile(data$temperature_mean, 0.99, na.rm = TRUE)
+  
+  cat("Original data rows:", nrow(data), "\n")
+  cat("Temperature range:", round(range(data$temperature_mean, na.rm = TRUE), 1), "°C\n")
+  cat("1% percentile:", round(temp_p1, 1), "°C\n")
+  cat("99% percentile:", round(temp_p99, 1), "°C\n")
+  
+  # Filter data: keep data within 1%-99% range
+  data_filtered <- data[data$temperature_mean >= temp_p1 & 
+                          data$temperature_mean <= temp_p99, ]
+  
+  # Remove NA values
+  data_filtered <- data_filtered[!is.na(data_filtered$temperature_mean), ]
+  
+  cat("Filtered data rows:", nrow(data_filtered), "\n")
+  cat("Removed data amount:", nrow(data) - nrow(data_filtered), "rows (", 
+      round((nrow(data) - nrow(data_filtered))/nrow(data)*100, 1), "%)\n")
+  cat("Filtered temperature range:", round(range(data_filtered$temperature_mean, na.rm = TRUE), 1), "°C\n")
+  
+  return(data_filtered)
+}
+
+##############################################################
+# Temperature binning function - 12 bins, reference temperature set to 18°C
+##############################################################
+create_temperature_bins <- function(data, temp_var = "temperature_mean", n_bins = 12, reference_temp = 18) {
+  
+  cat("\n=== Creating Temperature Bins (12-Bin Mode) ===\n")
+  cat("Target reference temperature:", reference_temp, "°C\n")
+  cat("Number of bins:", n_bins, "\n")
+  
+  # Calculate temperature quantiles
+  temp_quantiles <- quantile(data[[temp_var]], 
+                             probs = seq(0, 1, length.out = n_bins + 1), 
+                             na.rm = TRUE)
+  
+  cat("Temperature quantile cutpoints:\n")
+  print(round(temp_quantiles, 1))
+  
+  # Create temperature bins
+  data$temp_bin <- cut(data[[temp_var]], 
+                       breaks = temp_quantiles,
+                       include.lowest = TRUE,
+                       labels = paste0("tbin", 1:n_bins))
+  
+  # Find bin closest to 18°C
+  temp_bin_centers <- data %>%
+    group_by(temp_bin) %>%
+    summarise(temp_center = mean(.data[[temp_var]], na.rm = TRUE), .groups = 'drop')
+  
+  closest_bin_idx <- which.min(abs(temp_bin_centers$temp_center - reference_temp))
+  reference_bin <- paste0("tbin", closest_bin_idx)
+  
+  cat("Selected reference bin:", reference_bin, ", center temperature:", 
+      round(temp_bin_centers$temp_center[closest_bin_idx], 1), "°C\n")
+  
+  data$temp_bin <- relevel(factor(data$temp_bin), ref = reference_bin)
+  
+  # Create bin statistics table
+  bin_stats <- data %>%
+    group_by(temp_bin) %>%
+    summarise(
+      n_obs = n(),
+      temp_min = round(min(.data[[temp_var]], na.rm = TRUE), 1),
+      temp_max = round(max(.data[[temp_var]], na.rm = TRUE), 1),
+      temp_mean = round(mean(.data[[temp_var]], na.rm = TRUE), 1),
+      cases_total = sum(cases, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    mutate(temp_range = paste0(temp_min, "-", temp_max, "°C"))
+  
+  cat("\n12 Temperature Bin Statistics:\n")
+  print(bin_stats[, c("temp_bin", "temp_range", "temp_mean", "n_obs", "cases_total")])
+  
+  return(list(data = data, bin_stats = bin_stats, reference_bin = reference_bin))
+}
+
+##############################################################
+# Create ICU interaction terms - Support 12 bins
+##############################################################
+create_temp_icu_interactions <- function(data, n_bins = 12) {
+  
+  cat("\n=== Creating Temperature Bin × ICU Interaction Terms (12 Bins) ===\n")
+  
+  # Check ICU variable
+  if("ICU_binary" %in% names(data)) {
+    cat("ICU_binary variable distribution:\n")
+    print(table(data$ICU_binary, useNA = "ifany"))
+    
+    data$ICU_binary_num <- ifelse(data$ICU_binary == "Has_ICU", 1, 0)
+    
+  } else if("ICU_binary_num" %in% names(data)) {
+    cat("Using existing ICU_binary_num variable\n")
+    data$ICU_binary <- ifelse(data$ICU_binary_num == 1, "Has_ICU", "No_ICU")
+  } else {
+    stop("ICU variable not found. Please ensure data contains ICU_binary or ICU_binary_num variable")
+  }
+  
+  # Create interaction terms for 12 bins
+  for(i in 1:n_bins) {
+    bin_name <- paste0("tbin", i)
+    
+    # Create bin indicator variable
+    data[[paste0("temp_", bin_name)]] <- as.numeric(data$temp_bin == bin_name)
+    
+    # Create interaction terms with ICU
+    data[[paste0("temp_", bin_name, "_no_icu")]] <- 
+      data[[paste0("temp_", bin_name)]] * (1 - data$ICU_binary_num)
+    
+    data[[paste0("temp_", bin_name, "_has_icu")]] <- 
+      data[[paste0("temp_", bin_name)]] * data$ICU_binary_num
+  }
+  
+  cat("Created interaction term variables:", n_bins * 2, "variables (24 interaction terms)\n")
+  
+  return(data)
+}
+
+##############################################################
+# Estimate model - Support 12 bins
+##############################################################
+estimate_binned_model <- function(data, reference_bin, n_bins = 12) {
+  
+  cat("\n=== Estimating Temperature Binned Model (12 Bins) ===\n")
+  cat("Reference bin:", reference_bin, "\n")
+  
+  ref_num <- as.numeric(gsub("tbin", "", reference_bin))
+  
+  # Build model terms (excluding reference bin)
+  temp_terms <- c()
+  for(i in 1:n_bins) {
+    if(i != ref_num) {
+      temp_terms <- c(temp_terms, 
+                      paste0("temp_tbin", i, "_no_icu"),
+                      paste0("temp_tbin", i, "_has_icu"))
+    }
+  }
+  
+  # Check available land use variables
+  landuse_vars <- c("forest", "farming", "urban")
+  available_landuse <- landuse_vars[landuse_vars %in% names(data)]
+  
+  if(length(available_landuse) > 0) {
+    cat("Included land use control variables:", paste(available_landuse, collapse = ", "), "\n")
+    control_vars <- c("humidity_mean", "pressure_mean", "wind_speed_mean", available_landuse)
+  } else {
+    cat("Warning: No land use variables found\n")
+    control_vars <- c("humidity_mean", "pressure_mean", "wind_speed_mean")
+  }
+  
+  formula_str <- paste("cases ~", 
+                       paste(control_vars, collapse = " + "), "+",
+                       paste(temp_terms, collapse = " + "),
+                       "| cityid + year_month")
+  
+  cat("Model estimation in progress (including", length(temp_terms), "temperature interaction terms)...\n")
+  
+  # Estimate model
+  model <- fepois(as.formula(formula_str), 
+                  offset = ~log_population, 
+                  data = data)
+  
+  cat("12-bin model estimation completed, coefficient count:", length(coef(model)), "\n")
+  
+  return(model)
+}
+
+##############################################################
+# Calculate predictions - Support 12 bins
+##############################################################
+calculate_binned_predictions <- function(model, bin_stats, reference_bin, n_bins = 12, alpha = 0.05) {
+  
+  cat("\n=== Calculating 12-Bin Predictions ===\n")
+  
+  coef_est <- coef(model)
+  vcov_matrix <- vcov(model)
+  
+  results <- data.frame()
+  ref_num <- as.numeric(gsub("tbin", "", reference_bin))
+  
+  for(i in 1:n_bins) {
+    bin_name <- paste0("tbin", i)
+    bin_info <- bin_stats[bin_stats$temp_bin == bin_name, ]
+    
+    for(icu_status in c("No_ICU", "Has_ICU")) {
+      
+      if(i == ref_num) {
+        # Reference bin coefficient is 0
+        coef_val <- 0
+        se_val <- 0
+      } else {
+        # Non-reference bins
+        var_name <- if(icu_status == "No_ICU") {
+          paste0("temp_tbin", i, "_no_icu")
+        } else {
+          paste0("temp_tbin", i, "_has_icu")
+        }
+        
+        if(var_name %in% names(coef_est)) {
+          coef_val <- coef_est[var_name]
+          se_val <- sqrt(vcov_matrix[var_name, var_name])
+        } else {
+          coef_val <- 0
+          se_val <- 0
+        }
+      }
+      
+      # Calculate relative risk ratio and confidence interval
+      rr <- exp(coef_val)
+      ci_lower <- exp(coef_val - qnorm(1 - alpha/2) * se_val)
+      ci_upper <- exp(coef_val + qnorm(1 - alpha/2) * se_val)
+      
+      results <- rbind(results, data.frame(
+        temp_bin = bin_name,
+        bin_number = i,
+        ICU_status = icu_status,
+        temp_mean = bin_info$temp_mean,
+        temp_range = bin_info$temp_range,
+        coefficient = coef_val,
+        std_error = se_val,
+        relative_risk = rr,
+        ci_lower = ci_lower,
+        ci_upper = ci_upper,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  # Sort by temperature
+  results <- results[order(results$bin_number, results$ICU_status), ]
+  
+  cat("12-bin prediction calculation completed,", nrow(results), "data points\n")
+  
+  return(results)
+}
+
+##############################################################
+# Enhanced 12-bin forest plot visualization function - Modified with larger axis labels
+##############################################################
+create_forest_plot_12bins <- function(results, reference_bin, model, save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("\n=== Creating 12-Bin Forest Plot Visualization ===\n")
+  
+  ref_num <- as.numeric(gsub("tbin", "", reference_bin))
+  
+  # Calculate group difference significance (No ICU vs Has ICU)
+  vcov_matrix <- vcov(model)
+  coef_est <- coef(model)
+  
+  group_diff_results <- data.frame()
+  
+  for(i in 1:12) {
+    if(i != ref_num) {
+      # Get variable names
+      no_icu_var <- paste0("temp_tbin", i, "_no_icu")
+      has_icu_var <- paste0("temp_tbin", i, "_has_icu")
+      
+      if(no_icu_var %in% names(coef_est) && has_icu_var %in% names(coef_est)) {
+        # Calculate coefficient difference
+        coef_diff <- coef_est[no_icu_var] - coef_est[has_icu_var]
+        
+        # Calculate standard error of difference: Var(β1 - β2) = Var(β1) + Var(β2) - 2*Cov(β1, β2)
+        var_diff <- vcov_matrix[no_icu_var, no_icu_var] + 
+          vcov_matrix[has_icu_var, has_icu_var] - 
+          2 * vcov_matrix[no_icu_var, has_icu_var]
+        se_diff <- sqrt(var_diff)
+        
+        # Calculate p-value
+        z_score <- coef_diff / se_diff
+        p_value <- 2 * (1 - pnorm(abs(z_score)))
+        
+        group_diff_results <- rbind(group_diff_results, data.frame(
+          bin_number = i,
+          coef_diff = coef_diff,
+          se_diff = se_diff,
+          p_value = p_value,
+          significance = case_when(
+            p_value < 0.001 ~ "***",
+            p_value < 0.01 ~ "**", 
+            p_value < 0.05 ~ "*",
+            TRUE ~ ""
+          )
+        ))
+      }
+    } else {
+      # Reference bin
+      group_diff_results <- rbind(group_diff_results, data.frame(
+        bin_number = i,
+        coef_diff = 0,
+        se_diff = 0,
+        p_value = 1,
+        significance = ""
+      ))
+    }
+  }
+  
+  # Prepare forest plot data
+  forest_data <- results %>%
+    left_join(group_diff_results, by = "bin_number") %>%
+    mutate(
+      # Use temperature range as labels
+      temp_label = paste0(temp_range, "\n(", temp_mean, "°C)"),
+      is_reference = (bin_number == ref_num),
+      color_group = ifelse(ICU_status == "No_ICU", "No ICU Areas", "Has ICU Areas"),
+      bin_label = paste0("T", bin_number),
+      # Create Y-axis positions for offset display
+      y_position = as.numeric(factor(bin_number, levels = rev(1:12))),
+      y_dodge = ifelse(ICU_status == "No_ICU", y_position - 0.15, y_position + 0.15)
+    ) %>%
+    arrange(bin_number, ICU_status)
+  
+  # Define colors
+  colors <- c("No ICU Areas" = "#e74c3c", "Has ICU Areas" = "#3498db")
+  
+  # Create temperature range labels (deduplicated)
+  temp_labels <- forest_data %>%
+    group_by(bin_number) %>%
+    summarise(
+      temp_label = first(temp_label),
+      y_center = first(y_position),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(y_center))
+  
+  # Get data range, optimize X-axis layout
+  all_values <- c(forest_data$ci_lower, forest_data$ci_upper)
+  x_min <- max(0.05, min(all_values, na.rm = TRUE) * 0.8)
+  x_max <- min(50, max(all_values, na.rm = TRUE) * 1.2)
+  
+  # Create 12-bin forest plot
+  forest_plot <- ggplot(forest_data, aes(x = relative_risk, y = y_dodge)) +
+    
+    # Add reference line
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", size = 0.8) +
+    
+    # Add confidence interval line segments - use dashed lines to weaken effect
+    geom_segment(aes(x = ci_lower, xend = ci_upper, y = y_dodge, yend = y_dodge, color = color_group),
+                 size = 1.2, alpha = 0.6, linetype = "dashed") +
+    
+    # Add point estimates
+    geom_point(aes(color = color_group, shape = color_group), 
+               size = 3.5, stroke = 1.2) +
+    
+    # Add group difference significance markers (only mark once at the center position of each bin)
+    geom_text(data = temp_labels %>% 
+                left_join(group_diff_results, by = "bin_number") %>%
+                filter(significance != ""),
+              aes(x = x_max * 0.95, y = y_center, label = significance),
+              size = 5, fontface = "bold", hjust = 1, color = "black",
+              inherit.aes = FALSE) +
+    
+    # Use log scale - optimized range
+    scale_x_log10(
+      breaks = c(0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50),
+      labels = c("0.1", "0.2", "0.5", "1.0", "2.0", "5.0", "10.0", "20.0", "50.0"),
+      limits = c(x_min, x_max)
+    ) +
+    
+    # Set Y-axis
+    scale_y_continuous(
+      breaks = temp_labels$y_center,
+      labels = temp_labels$temp_label,
+      limits = c(0.5, 12.5)
+    ) +
+    
+    # Set colors and shapes
+    scale_color_manual(values = colors, name = "Area Type") +
+    scale_shape_manual(values = c(16, 17), name = "Area Type") +
+    
+    # Set theme
+    theme_minimal() +
+    theme(
+      text = element_text(family = "sans", color = "#333333"),
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5, margin = margin(b = 20)),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray60"),
+      axis.title.x = element_text(size = 24, margin = margin(t = 15)),  # Doubled font size
+      axis.title.y = element_text(size = 24, margin = margin(r = 15)),  # Doubled font size
+      axis.text.x = element_text(size = 26),
+      axis.text.y = element_text(size = 22, lineheight = 0.8),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line(color = "gray90", size = 0.5),
+      panel.grid.major.x = element_line(color = "gray90", size = 0.5),
+      legend.position = "bottom",
+      legend.title = element_text(size = 22, face = "bold"),
+      legend.text = element_text(size = 20),
+      legend.box.margin = margin(t = 15),
+      plot.margin = margin(20, 20, 20, 20)
+    ) +
+    
+    # Set labels
+    labs(
+      title = "Temperature Bin × ICU Interaction Effect Forest Plot for Chikungunya Incidence Risk (12 Bins)",
+      subtitle = paste0("Reference temperature interval: ", forest_data$temp_range[forest_data$is_reference][1], " | Group difference significance: *p<0.05, **p<0.01, ***p<0.001"),
+      x = "Relative Risk Ratio (95% Confidence Interval, Log Scale)",
+      y = "Temperature Bins"
+    )
+  
+  # Save 12-bin forest plot
+  forest_file <- file.path(save_path, "temperature_icu_forest_plot_12bins_combined.png")
+  ggsave(forest_file, forest_plot, width = 16, height = 12, dpi = 300, bg = "white")
+  
+  cat("12-bin forest plot saved to:", forest_file, "\n")
+  
+  # Output group difference significance results summary
+  sig_results <- group_diff_results %>%
+    filter(significance != "") %>%
+    left_join(results %>% select(bin_number, temp_range, temp_mean) %>% distinct(), by = "bin_number")
+  
+  if(nrow(sig_results) > 0) {
+    cat("\nGroup difference significance results summary:\n")
+    print(sig_results[, c("bin_number", "temp_range", "temp_mean", "coef_diff", "p_value", "significance")])
+  } else {
+    cat("\nNo significant group differences found\n")
+  }
+  
+  return(list(plot = forest_plot, file = forest_file, 
+              group_significance_results = sig_results,
+              all_group_comparisons = group_diff_results))
+}
+
+##############################################################
+# Enhanced 12-bin layered visualization function - Modified to remove bottom text and pink lines
+##############################################################
+plot_temperature_icu_with_distribution_12bins <- function(results, temp_data, data, reference_bin, 
+                                                          save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("\n=== Creating 12-Bin Layered Visualization Chart ===\n")
+  
+  ref_num <- as.numeric(gsub("tbin", "", reference_bin))
+  ref_temp <- results$temp_mean[results$bin_number == ref_num][1]
+  
+  # Define color scheme
+  no_icu_color <- "#e74c3c"        # Red series - No ICU
+  has_icu_color <- "#3498db"       # Blue series - Has ICU
+  ci_no_icu_color <- "#fadbd8"     # Light red confidence interval
+  ci_has_icu_color <- "#d5e8f7"    # Light blue confidence interval
+  hist_fill_color <- "#99ccee"     # Blue histogram
+  grid_color <- "#e6e6e6"          # Light gray grid lines
+  text_color <- "#333333"          # Dark gray text
+  mean_line_color <- "#0066cc"     # Blue mean line
+  
+  # Determine chart size and layout parameters
+  layout_heights <- c(0.618, 0.382)  # Golden ratio
+  
+  # Create PNG image - 12-bin needs larger size
+  png_file <- file.path(save_path, "temperature_icu_interaction_distribution_12bins.png")
+  png(filename = png_file, width = 14, height = 12, units = "in", res = 300)
+  
+  # Set layout
+  layout(matrix(c(1,2), nrow = 2, byrow = TRUE), heights = layout_heights)
+  
+  # Set plot parameters - top plot
+  par(mar = c(0, 5, 4, 2), cex.axis = 1.0, cex.lab = 1.2, family = "sans")
+  
+  # Top plot: 12-bin temperature × ICU interaction effect
+  rr_range <- range(c(results$relative_risk, results$ci_lower, results$ci_upper), na.rm = TRUE)
+  
+  # Adjust Y-axis range
+  y_min <- max(min(rr_range[1] * 0.8), 0.1)
+  y_max <- min(max(rr_range[2] * 1.3), 30)
+  
+  plot(results$temp_mean, results$relative_risk, type = 'n', 
+       ylim = c(y_min, y_max),
+       xlim = range(results$temp_mean),
+       xlab = "", ylab = "", axes = FALSE, log = "y")
+  
+  # Add grid lines
+  temp_breaks <- pretty(results$temp_mean, n = 10)
+  y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0)
+  y_breaks <- y_breaks[y_breaks >= y_min & y_breaks <= y_max]
+  
+  abline(h = y_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  abline(v = temp_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  
+  # Add reference lines
+  abline(h = 1, col = "gray40", lty = 2, lwd = 1.2)
+  
+  # Process data for two ICU groups separately
+  no_icu_data <- results[results$ICU_status == "No_ICU", ]
+  has_icu_data <- results[results$ICU_status == "Has_ICU", ]
+  
+  # Add confidence intervals (12-bin has many points, use semi-transparent)
+  polygon_x_no <- c(no_icu_data$temp_mean, rev(no_icu_data$temp_mean))
+  polygon_y_no <- c(no_icu_data$ci_lower, rev(no_icu_data$ci_upper))
+  polygon(polygon_x_no, polygon_y_no, col = add.alpha(ci_no_icu_color, 0.25), border = NA)
+  
+  polygon_x_has <- c(has_icu_data$temp_mean, rev(has_icu_data$temp_mean))
+  polygon_y_has <- c(has_icu_data$ci_lower, rev(has_icu_data$ci_upper))
+  polygon(polygon_x_has, polygon_y_has, col = add.alpha(ci_has_icu_color, 0.25), border = NA)
+  
+  # Draw main curves (12-bin, lines slightly thinner)
+  lines(no_icu_data$temp_mean, no_icu_data$relative_risk, lwd = 2.5, col = no_icu_color)
+  points(no_icu_data$temp_mean, no_icu_data$relative_risk, 
+         col = no_icu_color, pch = 16, cex = 1.5)
+  
+  lines(has_icu_data$temp_mean, has_icu_data$relative_risk, lwd = 2.5, col = has_icu_color)
+  points(has_icu_data$temp_mean, has_icu_data$relative_risk, 
+         col = has_icu_color, pch = 17, cex = 1.5)
+  
+  # Add reference point markers
+  ref_points <- results[results$bin_number == ref_num, ]
+  if(nrow(ref_points) > 0) {
+    points(ref_points$temp_mean, ref_points$relative_risk, 
+           col = "gray20", pch = 19, cex = 2.2)
+  }
+  
+  # Add Y-axis
+  axis(2, at = y_breaks, labels = as.character(y_breaks), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Relative Risk Ratio (95% CI)", side = 2, line = 3.5, cex = 1.2, col = text_color)
+  
+  # Add legend
+  legend("topleft", 
+         legend = c("No ICU Areas", "Has ICU Areas", "Reference Point (18°C)"), 
+         col = c(no_icu_color, has_icu_color, "gray20"),
+         pch = c(16, 17, 19), 
+         lwd = c(2.5, 2.5, NA),
+         cex = 1.0,
+         bg = "white",
+         box.col = "gray80")
+  
+  # Add title
+  mtext("Temperature Bin × ICU Interaction Effect for Chikungunya Incidence Risk (12 Bins)", side = 3, line = 1, cex = 1.4, font = 2, col = text_color)
+  
+  # Bottom plot: Temperature frequency distribution histogram
+  par(mar = c(4.5, 5, 0.5, 2))
+  
+  # Filter temperature data to display range
+  temp_filtered <- temp_data[temp_data >= min(results$temp_mean) & 
+                               temp_data <= max(results$temp_mean)]
+  
+  # Create histogram (12-bin, need more bins)
+  actual_min <- min(temp_filtered, na.rm = TRUE)
+  actual_max <- max(temp_filtered, na.rm = TRUE)
+  hist_breaks <- seq(floor(actual_min), ceiling(actual_max), by = 0.8)  # Denser histogram
+  
+  hist_result <- hist(temp_filtered, breaks = hist_breaks, plot = FALSE)
+  hist_percent <- hist_result$counts / sum(hist_result$counts) * 100
+  
+  # Draw histogram
+  plot(1, 1, type = "n", 
+       xlim = range(results$temp_mean), 
+       ylim = c(0, max(hist_percent) * 1.2), 
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # Add bar chart
+  for(i in 1:length(hist_percent)) {
+    if(hist_breaks[i] <= max(results$temp_mean) && 
+       hist_breaks[i+1] >= min(results$temp_mean)) {
+      rect(hist_breaks[i], 0, hist_breaks[i+1], hist_percent[i], 
+           col = add.alpha(hist_fill_color, 0.6), 
+           border = add.alpha("gray80", 0.4))
+    }
+  }
+  
+  # Add 12 temperature bin dividing lines
+  unique_temps <- sort(unique(results$temp_mean))
+  for(temp in unique_temps) {
+    abline(v = temp, col = "gray50", lty = 3, lwd = 0.8)
+  }
+  
+  # Add X-axis
+  axis(1, at = temp_breaks, labels = temp_breaks, col.axis = text_color, col = "gray70")
+  mtext("Temperature (°C)", side = 1, line = 3, cex = 1.2, col = text_color)
+  
+  # Add mean line (keep this one)
+  temp_mean <- mean(temp_filtered, na.rm = TRUE)
+  abline(v = temp_mean, col = mean_line_color, lty = 1, lwd = 1.5)
+  
+  # Add Y-axis
+  y_ticks <- pretty(c(0, max(hist_percent)), n = 5)
+  axis(2, at = y_ticks, labels = paste0(format(y_ticks, digits = 1), "%"), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Sample Distribution\nFrequency (%)", side = 2, line = 2.8, cex = 1.2, col = text_color)
+  
+  # Add statistical information (only mean line information)
+  text(temp_mean, max(hist_percent) * 0.9, 
+       sprintf("Mean: %.1f°C", temp_mean), 
+       cex = 0.9, col = mean_line_color)
+  
+  # Add border
+  box(col = "gray70")
+  
+  dev.off()
+  
+  cat("12-bin layered visualization chart saved to:", png_file, "\n")
+  
+  return(png_file)
+}
+
+##############################################################
+# ICU protection effect calculation - 12-bin version
+##############################################################
+calculate_icu_protection_12bins <- function(results) {
+  
+  cat("\n=== 12-Bin ICU Protection Effect Analysis ===\n")
+  
+  protection_results <- data.frame()
+  
+  for(bin_num in unique(results$bin_number)) {
+    bin_data <- results[results$bin_number == bin_num, ]
+    
+    if(nrow(bin_data) == 2) {
+      no_icu_rr <- bin_data$relative_risk[bin_data$ICU_status == "No_ICU"]
+      has_icu_rr <- bin_data$relative_risk[bin_data$ICU_status == "Has_ICU"]
+      
+      # Protection effect = (No ICU risk - Has ICU risk) / No ICU risk * 100
+      protection_effect <- (no_icu_rr - has_icu_rr) / no_icu_rr * 100
+      
+      protection_results <- rbind(protection_results, data.frame(
+        bin_number = bin_num,
+        temp_bin = unique(bin_data$temp_bin),
+        temp_range = unique(bin_data$temp_range),
+        temp_mean = unique(bin_data$temp_mean),
+        no_icu_rr = no_icu_rr,
+        has_icu_rr = has_icu_rr,
+        protection_effect_pct = protection_effect
+      ))
+    }
+  }
+  
+  cat("ICU protection effect for each temperature bin (12 bins):\n")
+  print(protection_results[, c("temp_range", "temp_mean", "no_icu_rr", "has_icu_rr", "protection_effect_pct")])
+  
+  return(protection_results)
+}
+
+##############################################################
+# Main analysis function - V5.0 version (12 bins, including forest plot)
+##############################################################
+run_temperature_icu_analysis_v5_12bins <- function(data_clean, n_bins = 12, reference_temp = 18,
+                                                   save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("=== Starting Enhanced Temperature Bin ICU Interaction Analysis V5.0 (12 Bins) ===\n")
+  cat("Original data rows:", nrow(data_clean), "\n")
+  cat("Number of bins:", n_bins, "\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("Image save path:", save_path, "\n")
+  
+  # Ensure save path exists
+  if(!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+    cat("Created save path:", save_path, "\n")
+  }
+  
+  # Step 1: Filter extreme data (only remove data outside 1% and 99% percentiles)
+  data_filtered <- filter_extreme_temperatures(data_clean)
+  
+  # Step 2: Create 12 temperature bins (reference temperature 18°C)
+  binning_result <- create_temperature_bins(data_filtered, n_bins = n_bins, reference_temp = reference_temp)
+  data_binned <- binning_result$data
+  bin_stats <- binning_result$bin_stats
+  reference_bin <- binning_result$reference_bin
+  
+  # Step 3: Create 12-bin interaction terms
+  data_binned <- create_temp_icu_interactions(data_binned, n_bins)
+  
+  # Step 4: Estimate 12-bin model
+  model_binned <- estimate_binned_model(data_binned, reference_bin, n_bins)
+  
+  # Step 5: Calculate 12-bin predictions
+  pred_results <- calculate_binned_predictions(model_binned, bin_stats, reference_bin, n_bins)
+  
+  # Step 6: Calculate 12-bin ICU protection effects
+  icu_protection <- calculate_icu_protection_12bins(pred_results)
+  
+  # Step 7: Create 12-bin forest plot (enhanced version)
+  forest_result <- create_forest_plot_12bins(pred_results, reference_bin, model_binned, save_path)
+  
+  # Step 8: Create 12-bin layered visualization chart
+  layered_plot_file <- plot_temperature_icu_with_distribution_12bins(
+    results = pred_results,
+    temp_data = data_filtered$temperature_mean,
+    data = data_filtered,
+    reference_bin = reference_bin,
+    save_path = save_path
+  )
+  
+  # Result verification
+  ref_results <- pred_results[pred_results$bin_number == as.numeric(gsub("tbin", "", reference_bin)), ]
+  cat("\n=== Reference Point Verification (12 Bins) ===\n")
+  cat("Reference point risk ratio should be close to 1.0:\n")
+  print(ref_results[, c("ICU_status", "temp_range", "temp_mean", "relative_risk")])
+  
+  # Show extreme value analysis
+  cat("\n=== 12-Bin Extreme Value Analysis ===\n")
+  lowest_temp <- pred_results[pred_results$bin_number == 1, ]
+  highest_temp <- pred_results[pred_results$bin_number == max(pred_results$bin_number), ]
+  
+  cat("Lowest temperature segment (T1):\n")
+  cat("  Temperature range:", lowest_temp$temp_range[1], "\n")
+  cat("  No ICU risk ratio:", round(lowest_temp$relative_risk[lowest_temp$ICU_status == "No_ICU"], 2), "\n")
+  cat("  Has ICU risk ratio:", round(lowest_temp$relative_risk[lowest_temp$ICU_status == "Has_ICU"], 2), "\n")
+  
+  cat("Highest temperature segment (T12):\n")
+  cat("  Temperature range:", highest_temp$temp_range[1], "\n")
+  cat("  No ICU risk ratio:", round(highest_temp$relative_risk[highest_temp$ICU_status == "No_ICU"], 2), "\n")
+  cat("  Has ICU risk ratio:", round(highest_temp$relative_risk[highest_temp$ICU_status == "Has_ICU"], 2), "\n")
+  
+  # Find bins with highest risk
+  max_risk_no_icu <- pred_results[pred_results$ICU_status == "No_ICU", ]
+  max_risk_no_icu <- max_risk_no_icu[which.max(max_risk_no_icu$relative_risk), ]
+  
+  max_risk_has_icu <- pred_results[pred_results$ICU_status == "Has_ICU", ]
+  max_risk_has_icu <- max_risk_has_icu[which.max(max_risk_has_icu$relative_risk), ]
+  
+  cat("Highest risk bins:\n")
+  cat("  No ICU group: T", max_risk_no_icu$bin_number, " (", max_risk_no_icu$temp_range, "), RR=", 
+      round(max_risk_no_icu$relative_risk, 2), "\n")
+  cat("  Has ICU group: T", max_risk_has_icu$bin_number, " (", max_risk_has_icu$temp_range, "), RR=", 
+      round(max_risk_has_icu$relative_risk, 2), "\n")
+  
+  # Temperature range analysis
+  cat("\n=== 12-Bin Data Filtering Effect ===\n")
+  original_temp_range <- range(data_clean$temperature_mean, na.rm = TRUE)
+  filtered_temp_range <- range(data_filtered$temperature_mean, na.rm = TRUE)
+  
+  cat("Original temperature range:", round(original_temp_range, 1), "°C\n")
+  cat("Filtered temperature range:", round(filtered_temp_range, 1), "°C\n")
+  cat("Removed data percentage:", round((nrow(data_clean) - nrow(data_filtered))/nrow(data_clean)*100, 1), "%\n")
+  cat("Average sample size per bin:", round(nrow(data_filtered)/12, 0), "rows\n")
+  
+  # Model fit quality
+  cat("\n=== 12-Bin Model Quality Assessment ===\n")
+  model_aic <- AIC(model_binned)
+  cat("Model AIC:", format(model_aic, scientific = FALSE), "\n")
+  cat("Model coefficient count:", length(coef(model_binned)), "\n")
+  cat("Temperature interaction terms:", (n_bins - 1) * 2, "terms\n")
+  
+  # Significance statistics
+  coef_summary <- summary(model_binned)
+  temp_coefs <- coef_summary$coefficients[grepl("temp_tbin", rownames(coef_summary$coefficients)), ]
+  significant_coefs <- sum(temp_coefs[, "Pr(>|z|)"] < 0.05, na.rm = TRUE)
+  
+  cat("Significant temperature interaction terms:", significant_coefs, "terms (", 
+      round(significant_coefs/nrow(temp_coefs)*100, 1), "%)\n")
+  
+  cat("\n=== V5.0 12-Bin Analysis Completed ===\n")
+  cat("Generated chart files:\n")
+  cat("1. 12-bin forest plot:", forest_result$file, "\n")
+  cat("2. 12-bin layered plot:", layered_plot_file, "\n")
+  
+  return(list(
+    model = model_binned,
+    predictions = pred_results,
+    icu_protection = icu_protection,
+    forest_plot = forest_result$plot,
+    forest_file = forest_result$file,
+    layered_plot_file = layered_plot_file,
+    reference_bin = reference_bin,
+    bin_stats = bin_stats,
+    data_original = data_clean,
+    data_filtered = data_filtered,
+    original_temp_range = original_temp_range,
+    filtered_temp_range = filtered_temp_range,
+    save_path = save_path,
+    n_bins = n_bins,
+    model_aic = model_aic,
+    significant_coefs = significant_coefs,
+    group_significance_results = forest_result$group_significance_results,
+    all_group_comparisons = forest_result$all_group_comparisons
+  ))
+}
+
+##############################################################
+# Data requirements checking function
+##############################################################
+check_data_requirements <- function(data) {
+  
+  cat("=== Data Requirements Check (12-Bin Version) ===\n")
+  
+  required_vars <- c("temperature_mean", "cases", "ICU_binary", 
+                     "humidity_mean", "pressure_mean", "wind_speed_mean",
+                     "cityid", "year_month", "log_population")
+  
+  missing_vars <- required_vars[!required_vars %in% names(data)]
+  
+  if(length(missing_vars) > 0) {
+    cat("Missing variables:", paste(missing_vars, collapse = ", "), "\n")
+    cat("Please ensure data contains all the above variables\n")
+    return(FALSE)
+  }
+  
+  cat("✓ All required variables present\n")
+  
+  # Check land use variables
+  landuse_vars <- c("forest", "farming", "urban")
+  available_landuse <- landuse_vars[landuse_vars %in% names(data)]
+  
+  if(length(available_landuse) > 0) {
+    cat("Available land use control variables:", paste(available_landuse, collapse = ", "), "\n")
+  } else {
+    cat("Warning: No land use variables found, will only use basic control variables\n")
+  }
+  
+  # Check data completeness
+  for(var in required_vars) {
+    na_count <- sum(is.na(data[[var]]))
+    if(na_count > 0) {
+      cat("Warning:", var, "has", na_count, "missing values\n")
+    }
+  }
+  
+  # Check ICU variable
+  if("ICU_binary" %in% names(data)) {
+    icu_levels <- unique(data$ICU_binary)
+    cat("ICU_binary levels:", paste(icu_levels, collapse = ", "), "\n")
+  }
+  
+  # Check temperature range
+  temp_range <- range(data$temperature_mean, na.rm = TRUE)
+  cat("Temperature range:", round(temp_range[1], 1), "to", round(temp_range[2], 1), "°C\n")
+  
+  # Check minimum sample size needed for 12 bins
+  min_samples_needed <- 12 * 100  # At least 100 samples per bin
+  actual_samples <- nrow(data)
+  
+  if(actual_samples < min_samples_needed) {
+    cat("Warning: Sample size may be insufficient, recommend at least", min_samples_needed, "rows of data for 12-bin analysis\n")
+    cat("Current sample size:", actual_samples, "rows\n")
+  } else {
+    cat("✓ Sufficient sample size, supports 12-bin analysis\n")
+    cat("Expected samples per bin:", round(actual_samples/12, 0), "rows\n")
+  }
+  
+  cat("Data check completed\n\n")
+  return(TRUE)
+}
+
+##############################################################
+# 12-bin results interpretation function
+##############################################################
+interpret_12bins_results <- function(results) {
+  
+  cat("=== 12-Bin Results Interpretation ===\n")
+  
+  # Group by ICU status
+  no_icu_results <- results$predictions[results$predictions$ICU_status == "No_ICU", ]
+  has_icu_results <- results$predictions[results$predictions$ICU_status == "Has_ICU", ]
+  
+  # Find bins with highest and lowest risk
+  cat("No ICU Areas Risk Analysis:\n")
+  max_risk_no_icu <- no_icu_results[which.max(no_icu_results$relative_risk), ]
+  min_risk_no_icu <- no_icu_results[which.min(no_icu_results$relative_risk), ]
+  
+  cat("  Highest risk bin: T", max_risk_no_icu$bin_number, 
+      " (", max_risk_no_icu$temp_range, ", ", max_risk_no_icu$temp_mean, "°C), RR=", 
+      round(max_risk_no_icu$relative_risk, 2), "\n")
+  cat("  Lowest risk bin: T", min_risk_no_icu$bin_number, 
+      " (", min_risk_no_icu$temp_range, ", ", min_risk_no_icu$temp_mean, "°C), RR=", 
+      round(min_risk_no_icu$relative_risk, 2), "\n")
+  
+  cat("\nHas ICU Areas Risk Analysis:\n")
+  max_risk_has_icu <- has_icu_results[which.max(has_icu_results$relative_risk), ]
+  min_risk_has_icu <- has_icu_results[which.min(has_icu_results$relative_risk), ]
+  
+  cat("  Highest risk bin: T", max_risk_has_icu$bin_number, 
+      " (", max_risk_has_icu$temp_range, ", ", max_risk_has_icu$temp_mean, "°C), RR=", 
+      round(max_risk_has_icu$relative_risk, 2), "\n")
+  cat("  Lowest risk bin: T", min_risk_has_icu$bin_number, 
+      " (", min_risk_has_icu$temp_range, ", ", min_risk_has_icu$temp_mean, "°C), RR=", 
+      round(min_risk_has_icu$relative_risk, 2), "\n")
+  
+  # ICU protection effect analysis
+  cat("\nICU Protection Effect Analysis:\n")
+  protection_stats <- results$icu_protection
+  max_protection <- protection_stats[which.max(protection_stats$protection_effect_pct), ]
+  min_protection <- protection_stats[which.min(protection_stats$protection_effect_pct), ]
+  
+  cat("  Maximum protection effect: T", max_protection$bin_number, 
+      " (", max_protection$temp_range, "), protection effect=", 
+      round(max_protection$protection_effect_pct, 1), "%\n")
+  cat("  Minimum protection effect: T", min_protection$bin_number, 
+      " (", min_protection$temp_range, "), protection effect=", 
+      round(min_protection$protection_effect_pct, 1), "%\n")
+  
+  # Statistical significance analysis
+  cat("\nStatistical Significance Analysis:\n")
+  cat("  Model AIC:", format(results$model_aic, scientific = FALSE), "\n")
+  cat("  Significant interaction terms:", results$significant_coefs, "terms\n")
+  cat("  Number of bins:", results$n_bins, "bins\n")
+  cat("  Sample size:", nrow(results$data_filtered), "rows\n")
+  
+  # Critical temperature threshold identification
+  cat("\nCritical Temperature Threshold Identification:\n")
+  
+  # High risk threshold (RR > 2.0)
+  high_risk_bins <- no_icu_results[no_icu_results$relative_risk > 2.0, ]
+  if(nrow(high_risk_bins) > 0) {
+    min_high_temp <- min(high_risk_bins$temp_mean)
+    cat("  High risk temperature threshold (No ICU): ≥", round(min_high_temp, 1), "°C\n")
+  }
+  
+  high_risk_bins_icu <- has_icu_results[has_icu_results$relative_risk > 2.0, ]
+  if(nrow(high_risk_bins_icu) > 0) {
+    min_high_temp_icu <- min(high_risk_bins_icu$temp_mean)
+    cat("  High risk temperature threshold (Has ICU): ≥", round(min_high_temp_icu, 1), "°C\n")
+  }
+  
+  cat("\n=== 12-Bin Results Interpretation Completed ===\n")
+}
+
+##############################################################
+# Usage examples and instructions
+##############################################################
+
+# Main analysis function call example
+if(exists("data_clean")) {
+  
+  cat("=== data_clean Dataset Detected (12-Bin Version) ===\n")
+  
+  # Data check
+  if(check_data_requirements(data_clean)) {
+    
+    # Run V5.0 version 12-bin analysis
+    cat("Starting V5.0 version Temperature Bin ICU Interaction Analysis (12 bins, including forest plot)...\n")
+    results_v5_12bins <- run_temperature_icu_analysis_v5_12bins(
+      data_clean, 
+      n_bins = 12,
+      reference_temp = 18,  # Reference temperature set to 18°C
+      save_path = "C:/Users/a1230/Desktop/picture"
+    )
+    
+    cat("\n=== V5.0 12-Bin Analysis Completed ===\n")
+    cat("Available results:\n")
+    cat("- results_v5_12bins$model: 12-bin interaction model object\n")
+    cat("- results_v5_12bins$predictions: 12-bin ICU interaction prediction results\n")
+    cat("- results_v5_12bins$icu_protection: 12-bin ICU protection effect analysis\n")
+    cat("- results_v5_12bins$forest_plot: 12-bin forest plot ggplot object\n")
+    cat("- results_v5_12bins$forest_file: 12-bin forest plot file path\n")
+    cat("- results_v5_12bins$layered_plot_file: 12-bin layered plot file path\n")
+    cat("- results_v5_12bins$data_original: Original data\n")
+    cat("- results_v5_12bins$data_filtered: Filtered data\n")
+    cat("- results_v5_12bins$bin_stats: 12-bin statistics information\n")
+    cat("- results_v5_12bins$group_significance_results: Group difference significance results\n")
+    cat("- results_v5_12bins$all_group_comparisons: All group comparison results\n")
+    
+    # Show 12 temperature bin information
+    cat("\n=== 12 Temperature Bin Information ===\n")
+    print(results_v5_12bins$bin_stats[, c("temp_bin", "temp_range", "temp_mean", "n_obs")])
+    
+    # Interpret results
+    interpret_12bins_results(results_v5_12bins)
+    
+  } else {
+    cat("Data check failed, please check data format\n")
+  }
+  
+} else {
+  
+  cat("=== Usage Instructions (V5.0 Version - 12 Bins, Including Forest Plot) ===\n")
+  cat("Please prepare data_clean dataset first, containing the following variables:\n\n")
+  cat("Required variables:\n")
+  cat("- temperature_mean: Mean temperature\n")
+  cat("- cases: Case count\n") 
+  cat("- ICU_binary: ICU resource status ('No_ICU'/'Has_ICU')\n")
+  cat("- humidity_mean: Mean humidity\n")
+  cat("- pressure_mean: Mean pressure\n")
+  cat("- wind_speed_mean: Mean wind speed\n")
+  cat("- cityid: City ID\n")
+  cat("- year_month: Year-month\n")
+  cat("- log_population: Population logarithm\n\n")
+  
+  cat("Optional land use control variables:\n")
+  cat("- forest: Forest coverage rate\n")
+  cat("- farming: Agricultural land proportion\n")
+  cat("- urban: Urbanization proportion\n\n")
+  
+  cat("Usage:\n")
+  cat("# Check data\n")
+  cat("check_data_requirements(data_clean)\n\n")
+  cat("# Run V5.0 version 12-bin analysis\n")
+  cat("results_v5_12bins <- run_temperature_icu_analysis_v5_12bins(\n")
+  cat("  data_clean,\n")
+  cat("  n_bins = 12,         # 12 bins\n")
+  cat("  reference_temp = 18, # Reference temperature 18°C\n")
+  cat("  save_path = 'C:/Users/a1230/Desktop/picture'  # Image save path\n")
+  cat(")\n\n")
+  cat("# View results\n")
+  cat("print(results_v5_12bins$predictions)\n")
+  cat("print(results_v5_12bins$icu_protection)\n")
+  cat("print(results_v5_12bins$bin_stats)  # View 12-bin details\n")
+  cat("print(results_v5_12bins$group_significance_results)  # Group difference significance\n")
+  cat("interpret_12bins_results(results_v5_12bins)  # Results interpretation\n")
+  
+}
+
+cat("\n=== Enhanced Temperature Bin ICU Interaction Analysis Code V5.0 (12 Bins) Ready ===\n")
+cat("✅ Key Features:\n")
+cat("1. 12-bin high-resolution analysis - More precise temperature effect capture\n")
+cat("2. Reference temperature confirmed set to 18°C\n")
+cat("3. Data filtering: Only remove extreme data outside 1% and 99% percentiles (~2% data)\n")
+cat("4. New 12-bin forest plot visualization, clearly showing effect of each temperature interval\n")
+cat("5. Enhanced 12-bin layered visualization chart\n")
+cat("6. Temperature intervals displayed as ranges (e.g., 21.2-21.8°C)\n")
+cat("7. Forest plot combined display of ICU status, facilitating comparison of 12 temperature intervals\n")
+cat("8. Optimized forest plot layout, making full use of chart space\n")
+cat("9. High-resolution output, suitable for academic publication\n")
+cat("10. 24 interaction term coefficients (12 bins × 2 ICU statuses)\n")
+cat("11. Group difference significance testing (No ICU vs Has ICU)\n\n")
+
+cat("✅ Output Files:\n")
+cat("1. temperature_icu_forest_plot_12bins_combined.png - 12-bin forest plot (16x12 inches, 300dpi)\n")
+cat("2. temperature_icu_interaction_distribution_12bins.png - 12-bin layered plot (14x12 inches, 300dpi)\n\n")
+
+cat("✅ 12-Bin Forest Plot Features:\n")
+cat("- Clearly display specific ranges and center temperatures of 12 temperature intervals\n")
+cat("- Combined display of ICU status, facilitating comparison of 24 data points\n")
+cat("- Optimized X-axis layout, making full use of chart space\n")
+cat("- 95% confidence interval line segments + point estimates\n")
+cat("- Reference line annotation (RR=1.0)\n")
+cat("- Group difference significance markers (*p<0.05, **p<0.01, ***p<0.001)\n")
+cat("- Professional academic journal style, suitable for publication\n")
+cat("- Self-adaptive risk ratio range, avoiding space waste\n\n")
+
+cat("✅ 12-Bin Model Advantages:\n")
+cat("- More precise non-linear relationship capture\n")
+cat("- Approximately", round(404328*0.98/12, 0), "samples per bin (based on your data scale)\n")
+cat("- Identify more accurate high-risk temperature thresholds\n")
+cat("- More detailed ICU protection effect analysis\n")
+cat("- Better policy-making support (12 different temperature intervals)\n\n")
+
+cat("=== V5.0 Version 12-Bin Ready, Including Optimized Forest Plot and Group Difference Significance Testing ===\n")

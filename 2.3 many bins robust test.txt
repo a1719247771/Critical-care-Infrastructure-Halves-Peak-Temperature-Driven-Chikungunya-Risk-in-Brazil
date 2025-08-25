@@ -1,0 +1,438 @@
+library(fixest)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(gridExtra)
+
+##############################################################
+# Enhanced sensitivity analysis function (multiple bin numbers)
+##############################################################
+
+run_comprehensive_binned_analysis <- function(data_clean, 
+                                              bin_numbers = c(4, 5, 6, 7, 8, 10, 12), 
+                                              reference_temp = 18,
+                                              save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("=== Starting Comprehensive Temperature Binning Sensitivity Analysis ===\n")
+  cat("Testing bin numbers:", paste(bin_numbers, collapse = ", "), "\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  
+  # Ensure save path exists
+  if(!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+  }
+  
+  # Filter extreme data first (only once)
+  data_filtered <- filter_extreme_temperatures(data_clean)
+  
+  # Store all results
+  all_results <- list()
+  comparison_data <- data.frame()
+  
+  # Loop through different bin numbers
+  for(n_bins in bin_numbers) {
+    
+    cat("\n=== Analyzing", n_bins, "bins ===\n")
+    
+    tryCatch({
+      
+      # Step 1: Create temperature bins
+      binning_result <- create_temperature_bins_optimized(data_filtered, n_bins = n_bins, reference_temp = reference_temp)
+      data_binned <- binning_result$data
+      bin_stats <- binning_result$bin_stats
+      reference_bin <- binning_result$reference_bin
+      
+      # Step 2: Create bin indicator variables
+      data_binned <- create_temp_bins_variables(data_binned, n_bins)
+      
+      # Step 3: Estimate binned model
+      model_binned <- estimate_temp_binned_model_detailed(data_binned, reference_bin, n_bins)
+      
+      # Step 4: Calculate predictions
+      pred_binned <- calculate_temp_predictions_corrected(model_binned, bin_stats, reference_bin, n_bins)
+      
+      # Save results
+      all_results[[paste0("bins_", n_bins)]] <- list(
+        model = model_binned,
+        predictions = pred_binned,
+        bin_stats = bin_stats,
+        reference_bin = reference_bin,
+        n_bins = n_bins
+      )
+      
+      # Collect comparison data
+      model_info <- data.frame(
+        n_bins = n_bins,
+        aic = AIC(model_binned),
+        bic = BIC(model_binned),
+        loglik = as.numeric(logLik(model_binned)),
+        observations = nobs(model_binned),
+        max_rr = max(pred_binned$relative_risk),
+        min_rr = min(pred_binned$relative_risk),
+        rr_range = max(pred_binned$relative_risk) - min(pred_binned$relative_risk),
+        significant_bins = sum(pred_binned$ci_lower > 1 | pred_binned$ci_upper < 1),
+        reference_bin = reference_bin,
+        reference_temp_actual = pred_binned$temp_mean[pred_binned$temp_bin == reference_bin][1]
+      )
+      
+      comparison_data <- rbind(comparison_data, model_info)
+      
+      cat("✓ ", n_bins, "bin analysis completed\n")
+      
+    }, error = function(e) {
+      cat("✗ ", n_bins, "bin analysis failed:", e$message, "\n")
+    })
+  }
+  
+  # Print comparison results
+  cat("\n=== Model Comparison Summary ===\n")
+  print(comparison_data)
+  
+  # Find optimal model
+  if(nrow(comparison_data) > 0) {
+    best_aic_idx <- which.min(comparison_data$aic)
+    best_bic_idx <- which.min(comparison_data$bic)
+    
+    cat("\n=== Optimal Model Selection ===\n")
+    cat("Optimal bins based on AIC:", comparison_data$n_bins[best_aic_idx], 
+        " (AIC=", round(comparison_data$aic[best_aic_idx], 0), ")\n")
+    cat("Optimal bins based on BIC:", comparison_data$n_bins[best_bic_idx], 
+        " (BIC=", round(comparison_data$bic[best_bic_idx], 0), ")\n")
+  }
+  
+  return(list(
+    results = all_results,
+    comparison = comparison_data,
+    data_filtered = data_filtered,
+    reference_temp = reference_temp
+  ))
+}
+
+##############################################################
+# Visualization comparison function
+##############################################################
+
+plot_binned_comparison <- function(analysis_results, 
+                                   selected_bins = c(4, 6, 8, 10),
+                                   save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("\n=== Creating Binned Comparison Plot ===\n")
+  
+  # Prepare plot data
+  plot_data <- data.frame()
+  
+  for(n_bins in selected_bins) {
+    result_key <- paste0("bins_", n_bins)
+    if(result_key %in% names(analysis_results$results)) {
+      pred_data <- analysis_results$results[[result_key]]$predictions
+      pred_data$n_bins <- n_bins
+      pred_data$model_label <- paste0(n_bins, " bins")
+      plot_data <- rbind(plot_data, pred_data)
+    }
+  }
+  
+  if(nrow(plot_data) == 0) {
+    cat("No available plot data\n")
+    return(NULL)
+  }
+  
+  # Create comparison plot
+  p <- ggplot(plot_data, aes(x = temp_mean, y = relative_risk, color = model_label)) +
+    
+    # Reference lines
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray60", linewidth = 0.6) +
+    geom_vline(xintercept = analysis_results$reference_temp, linetype = "dotted", 
+               color = "#ffb3d9", linewidth = 0.8) +
+    
+    # Confidence intervals
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper, fill = model_label), 
+                alpha = 0.15, color = NA) +
+    
+    # Connecting lines
+    geom_line(linewidth = 1.2, alpha = 0.8) +
+    
+    # Data points
+    geom_point(size = 2.5, stroke = 1, fill = "white", shape = 21) +
+    
+    # Y-axis log scale
+    scale_y_continuous(
+      trans = "log",
+      breaks = c(0.2, 0.5, 1.0, 2.0, 5.0, 10.0),
+      labels = c("0.2", "0.5", "1.0", "2.0", "5.0", "10.0"),
+      name = "Relative Risk Ratio (95% CI)"
+    ) +
+    
+    # X-axis
+    scale_x_continuous(
+      name = "Temperature Bin Center (°C)",
+      breaks = pretty(plot_data$temp_mean, n = 8)
+    ) +
+    
+    # Color settings
+    scale_color_manual(
+      name = "Model Type",
+      values = c("#E74C3C", "#3498DB", "#2ECC71", "#F39C12", "#9B59B6", "#1ABC9C", "#34495E")[1:length(selected_bins)]
+    ) +
+    scale_fill_manual(
+      name = "Model Type", 
+      values = c("#E74C3C", "#3498DB", "#2ECC71", "#F39C12", "#9B59B6", "#1ABC9C", "#34495E")[1:length(selected_bins)]
+    ) +
+    
+    # Theme
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray40"),
+      legend.position = "bottom",
+      legend.title = element_text(size = 11, face = "bold"),
+      legend.text = element_text(size = 10),
+      axis.title = element_text(size = 11, face = "bold"),
+      axis.text = element_text(size = 10),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(color = "black", linewidth = 0.4)
+    ) +
+    
+    # Title
+    labs(
+      title = "Temperature Risk Comparison with Different Bin Numbers",
+      subtitle = paste0("Reference temperature: ", analysis_results$reference_temp, "°C")
+    )
+  
+  # Save plot
+  plot_file <- file.path(save_path, "temperature_binned_comparison.png")
+  ggsave(plot_file, p, width = 12, height = 8, dpi = 300)
+  
+  cat("Comparison plot saved to:", plot_file, "\n")
+  
+  return(p)
+}
+
+##############################################################
+# Model quality comparison plot
+##############################################################
+
+plot_model_quality_comparison <- function(analysis_results, 
+                                          save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  comparison_data <- analysis_results$comparison
+  
+  if(nrow(comparison_data) == 0) {
+    cat("No comparison data available for plotting\n")
+    return(NULL)
+  }
+  
+  # AIC comparison plot
+  p1 <- ggplot(comparison_data, aes(x = factor(n_bins), y = aic)) +
+    geom_col(fill = "#3498DB", alpha = 0.7, color = "black", linewidth = 0.5) +
+    geom_text(aes(label = round(aic, 0)), vjust = -0.5, size = 3) +
+    labs(title = "AIC Comparison", x = "Number of Bins", y = "AIC Value") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 0))
+  
+  # Risk range comparison plot
+  p2 <- ggplot(comparison_data, aes(x = factor(n_bins), y = rr_range)) +
+    geom_col(fill = "#E74C3C", alpha = 0.7, color = "black", linewidth = 0.5) +
+    geom_text(aes(label = round(rr_range, 2)), vjust = -0.5, size = 3) +
+    labs(title = "Risk Range Comparison", x = "Number of Bins", y = "Risk Ratio Range") +
+    theme_minimal()
+  
+  # Significant bins count comparison
+  p3 <- ggplot(comparison_data, aes(x = factor(n_bins), y = significant_bins)) +
+    geom_col(fill = "#2ECC71", alpha = 0.7, color = "black", linewidth = 0.5) +
+    geom_text(aes(label = significant_bins), vjust = -0.5, size = 3) +
+    labs(title = "Significant Bins Count", x = "Number of Bins", y = "Number of Significant Bins") +
+    theme_minimal()
+  
+  # Maximum risk ratio comparison
+  p4 <- ggplot(comparison_data, aes(x = factor(n_bins), y = max_rr)) +
+    geom_col(fill = "#F39C12", alpha = 0.7, color = "black", linewidth = 0.5) +
+    geom_text(aes(label = round(max_rr, 2)), vjust = -0.5, size = 3) +
+    labs(title = "Maximum Risk Ratio", x = "Number of Bins", y = "Maximum RR Value") +
+    theme_minimal()
+  
+  # Combined plot
+  combined_plot <- grid.arrange(p1, p2, p3, p4, ncol = 2, nrow = 2,
+                                top = "Bin Number Sensitivity Analysis: Model Quality Comparison")
+  
+  # Save plot
+  plot_file <- file.path(save_path, "model_quality_comparison.png")
+  ggsave(plot_file, combined_plot, width = 12, height = 10, dpi = 300)
+  
+  cat("Model quality comparison plot saved to:", plot_file, "\n")
+  
+  return(combined_plot)
+}
+
+##############################################################
+# Detailed results interpretation function
+##############################################################
+
+interpret_comprehensive_results <- function(analysis_results) {
+  
+  cat("\n=== Comprehensive Binning Analysis Results Interpretation ===\n")
+  
+  comparison_data <- analysis_results$comparison
+  
+  if(nrow(comparison_data) == 0) {
+    cat("No available analysis results\n")
+    return(invisible())
+  }
+  
+  # 1. Optimal model selection
+  best_aic_idx <- which.min(comparison_data$aic)
+  best_bic_idx <- which.min(comparison_data$bic)
+  
+  cat("1. Optimal model selection:\n")
+  cat("   AIC optimal:", comparison_data$n_bins[best_aic_idx], "bins (AIC=", 
+      round(comparison_data$aic[best_aic_idx], 0), ")\n")
+  cat("   BIC optimal:", comparison_data$n_bins[best_bic_idx], "bins (BIC=", 
+      round(comparison_data$bic[best_bic_idx], 0), ")\n")
+  
+  # 2. Risk range analysis
+  cat("\n2. Risk range analysis:\n")
+  for(i in 1:nrow(comparison_data)) {
+    cat("   ", comparison_data$n_bins[i], "bins: Risk ratio", 
+        round(comparison_data$min_rr[i], 2), "-", round(comparison_data$max_rr[i], 2),
+        " (range=", round(comparison_data$rr_range[i], 2), ")\n")
+  }
+  
+  # 3. Statistical significance
+  cat("\n3. Statistical significance analysis:\n")
+  for(i in 1:nrow(comparison_data)) {
+    cat("   ", comparison_data$n_bins[i], "bins:", comparison_data$significant_bins[i], 
+        "significant bins (", round(comparison_data$significant_bins[i]/comparison_data$n_bins[i]*100, 1), "%)\n")
+  }
+  
+  # 4. Model complexity vs goodness of fit trade-off
+  cat("\n4. Model complexity analysis:\n")
+  comparison_data$aic_change <- c(0, diff(comparison_data$aic))
+  comparison_data$bic_change <- c(0, diff(comparison_data$bic))
+  
+  for(i in 2:nrow(comparison_data)) {
+    aic_change <- comparison_data$aic_change[i]
+    if(aic_change < -10) {
+      improvement <- "significant improvement"
+    } else if(aic_change < 0) {
+      improvement <- "slight improvement"
+    } else if(aic_change < 10) {
+      improvement <- "slight deterioration"
+    } else {
+      improvement <- "significant deterioration"
+    }
+    
+    cat("   ", comparison_data$n_bins[i-1], "→", comparison_data$n_bins[i], 
+        "bins: AIC change", round(aic_change, 0), " (", improvement, ")\n")
+  }
+  
+  # 5. Recommendations
+  cat("\n5. Recommendations:\n")
+  
+  # Recommendations based on AIC improvement magnitude
+  if(nrow(comparison_data) >= 3) {
+    aic_improvements <- -comparison_data$aic_change[2:nrow(comparison_data)]
+    significant_improvements <- which(aic_improvements > 10)
+    
+    if(length(significant_improvements) > 0) {
+      best_tradeoff_idx <- significant_improvements[length(significant_improvements)] + 1
+      recommended_bins <- comparison_data$n_bins[best_tradeoff_idx]
+    } else {
+      recommended_bins <- comparison_data$n_bins[best_aic_idx]
+    }
+  } else {
+    recommended_bins <- comparison_data$n_bins[best_aic_idx]
+  }
+  
+  cat("   Recommend using", recommended_bins, "bin model\n")
+  cat("   Rationale: Achieves good balance between model complexity and goodness of fit\n")
+  
+  # 6. Specific results display
+  if(paste0("bins_", recommended_bins) %in% names(analysis_results$results)) {
+    recommended_result <- analysis_results$results[[paste0("bins_", recommended_bins)]]
+    pred_data <- recommended_result$predictions
+    
+    cat("\n6. Recommended model (", recommended_bins, "bins) detailed results:\n")
+    cat("   Reference bin:", recommended_result$reference_bin, "\n")
+    
+    # Sort by risk
+    pred_sorted <- pred_data[order(pred_data$relative_risk, decreasing = TRUE), ]
+    
+    cat("   Risk ranking (high→low):\n")
+    for(i in 1:nrow(pred_sorted)) {
+      significance <- if(pred_sorted$ci_lower[i] > 1) "**" else 
+        if(pred_sorted$ci_upper[i] < 1) "*" else ""
+      cat("     ", pred_sorted$temp_bin[i], " (", round(pred_sorted$temp_mean[i], 1), "°C): RR=", 
+          round(pred_sorted$relative_risk[i], 2), " [", 
+          round(pred_sorted$ci_lower[i], 2), "-", round(pred_sorted$ci_upper[i], 2), "]", 
+          significance, "\n")
+    }
+    cat("   ** Significantly increased risk, * Significantly decreased risk\n")
+  }
+  
+  return(invisible())
+}
+
+##############################################################
+# Main running function example
+##############################################################
+
+# If data_clean is detected, run comprehensive analysis
+if(exists("data_clean")) {
+  
+  cat("=== Starting Comprehensive Temperature Binning Sensitivity Analysis ===\n")
+  
+  # Data check
+  if(check_data_requirements_simple(data_clean)) {
+    
+    # Run comprehensive analysis - test more bin numbers
+    comprehensive_results <- run_comprehensive_binned_analysis(
+      data_clean, 
+      bin_numbers = c(4, 5, 6, 7, 8, 10, 12, 15),  # Test more bins
+      reference_temp = 18,
+      save_path = "C:/Users/a1230/Desktop/picture"
+    )
+    
+    # Interpret results
+    interpret_comprehensive_results(comprehensive_results)
+    
+    # Create comparison plots
+    comparison_plot <- plot_binned_comparison(
+      comprehensive_results, 
+      selected_bins = c(4, 6, 8, 10, 12),  # Select representative bin numbers for comparison
+      save_path = "C:/Users/a1230/Desktop/picture"
+    )
+    
+    # Create model quality comparison plots
+    quality_plot <- plot_model_quality_comparison(
+      comprehensive_results,
+      save_path = "C:/Users/a1230/Desktop/picture"
+    )
+    
+    cat("\n=== Comprehensive Temperature Binning Sensitivity Analysis Completed ===\n")
+    cat("Available results:\n")
+    cat("- comprehensive_results$results: All binned model results\n")
+    cat("- comprehensive_results$comparison: Model comparison table\n")
+    cat("- comparison_plot: Risk comparison plot\n")
+    cat("- quality_plot: Model quality comparison plot\n")
+    
+  } else {
+    cat("Data check failed\n")
+  }
+  
+} else {
+  
+  cat("=== Comprehensive Temperature Binning Sensitivity Analysis Usage Instructions ===\n")
+  cat("Please ensure data_clean dataset is available, then run:\n\n")
+  cat("comprehensive_results <- run_comprehensive_binned_analysis(\n")
+  cat("  data_clean,\n") 
+  cat("  bin_numbers = c(4, 5, 6, 7, 8, 10, 12, 15),\n")
+  cat("  reference_temp = 18\n")
+  cat(")\n\n")
+  cat("interpret_comprehensive_results(comprehensive_results)\n")
+  
+}
+
+cat("\n=== Comprehensive Temperature Binning Sensitivity Analysis Code Ready ===\n")
+cat("Testing bin numbers: 4, 5, 6, 7, 8, 10, 12, 15\n")
+cat("Output plots:\n")
+cat("1. temperature_binned_comparison.png - Risk curve comparison\n")
+cat("2. model_quality_comparison.png - Model quality comparison\n")

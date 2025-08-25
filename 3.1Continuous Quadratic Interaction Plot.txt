@@ -1,0 +1,1349 @@
+# Temperature-Dengue Risk ICU Interaction Analysis based on Continuous Quadratic Model (V4.0)
+# Based on original quadratic model, adding ICU interaction terms
+# Includes layered plots and forest plots for visualization
+
+library(fixest)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+
+##############################################################
+# Helper function: Add transparency
+##############################################################
+add.alpha <- function(col, alpha=1) {
+  apply(sapply(col, col2rgb)/255, 2, 
+        function(x) rgb(x[1], x[2], x[3], alpha))
+}
+
+##############################################################
+# Data filtering function - Remove extreme data outside 1st and 99th percentiles
+##############################################################
+filter_extreme_temperatures <- function(data) {
+  
+  cat("\n=== Filtering extreme temperature data (outside 1st and 99th percentiles) ===\n")
+  
+  # Calculate 1st and 99th percentiles
+  temp_p1 <- quantile(data$temperature_mean, 0.01, na.rm = TRUE)
+  temp_p99 <- quantile(data$temperature_mean, 0.99, na.rm = TRUE)
+  
+  cat("Original data rows:", nrow(data), "\n")
+  cat("Temperature range:", round(range(data$temperature_mean, na.rm = TRUE), 1), "°C\n")
+  cat("1st percentile:", round(temp_p1, 1), "°C\n")
+  cat("99th percentile:", round(temp_p99, 1), "°C\n")
+  
+  # Filter data: Keep data within 1%-99% range
+  data_filtered <- data[data$temperature_mean >= temp_p1 & 
+                          data$temperature_mean <= temp_p99, ]
+  
+  # Remove NA values
+  data_filtered <- data_filtered[!is.na(data_filtered$temperature_mean), ]
+  
+  cat("Filtered data rows:", nrow(data_filtered), "\n")
+  cat("Removed data count:", nrow(data) - nrow(data_filtered), "rows (", 
+      round((nrow(data) - nrow(data_filtered))/nrow(data)*100, 1), "%)\n")
+  cat("Filtered temperature range:", round(range(data_filtered$temperature_mean, na.rm = TRUE), 1), "°C\n")
+  
+  return(data_filtered)
+}
+
+##############################################################
+# 1. Estimate centered quadratic model with ICU interaction terms
+##############################################################
+estimate_quadratic_icu_interaction_model <- function(data, reference_temp = 18.0) {
+  
+  cat("\n=== Estimating temperature quadratic model with ICU interaction terms (reference:", reference_temp, "°C) ===\n")
+  
+  # Check ICU variable
+  if("ICU_binary" %in% names(data)) {
+    cat("ICU_binary variable distribution:\n")
+    print(table(data$ICU_binary, useNA = "ifany"))
+    
+    data$ICU_binary_num <- ifelse(data$ICU_binary == "Has_ICU", 1, 0)
+    
+  } else if("ICU_binary_num" %in% names(data)) {
+    cat("Using existing ICU_binary_num variable\n")
+    data$ICU_binary <- ifelse(data$ICU_binary_num == 1, "Has_ICU", "No_ICU")
+  } else {
+    stop("ICU variable not found, please ensure data contains ICU_binary or ICU_binary_num variable")
+  }
+  
+  # Create centered temperature variables
+  data$temperature_centered <- data$temperature_mean - reference_temp
+  data$temperature_centered_sq <- data$temperature_centered^2
+  
+  cat("Temperature centering completed, reference point:", reference_temp, "°C\n")
+  cat("Centered temperature range:", 
+      round(range(data$temperature_centered, na.rm = TRUE), 1), "\n")
+  
+  # Create ICU interaction terms
+  data$temp_centered_no_icu <- data$temperature_centered * (1 - data$ICU_binary_num)
+  data$temp_centered_sq_no_icu <- data$temperature_centered_sq * (1 - data$ICU_binary_num)
+  data$temp_centered_has_icu <- data$temperature_centered * data$ICU_binary_num
+  data$temp_centered_sq_has_icu <- data$temperature_centered_sq * data$ICU_binary_num
+  
+  # Basic control variables
+  control_vars <- c("humidity_mean", "pressure_mean", "wind_speed_mean")
+  
+  # Add land use variables (if exist)
+  landuse_vars <- c("forest", "farming", "urban")
+  available_landuse <- landuse_vars[landuse_vars %in% names(data)]
+  
+  if(length(available_landuse) > 0) {
+    cat("Included land use control variables:", paste(available_landuse, collapse = ", "), "\n")
+    control_vars <- c(control_vars, available_landuse)
+  }
+  
+  # Add other control variables (if exist)
+  other_vars <- c("hospital", "log_pop_density")
+  available_others <- other_vars[other_vars %in% names(data)]
+  if(length(available_others) > 0) {
+    control_vars <- c(control_vars, available_others)
+  }
+  
+  # Construct model formula - Including ICU interaction terms
+  temp_interaction_terms <- c("temp_centered_no_icu", "temp_centered_sq_no_icu",
+                              "temp_centered_has_icu", "temp_centered_sq_has_icu")
+  
+  formula_str <- paste("cases ~", 
+                       paste(control_vars, collapse = " + "), "+",
+                       paste(temp_interaction_terms, collapse = " + "),
+                       "| cityid + year_month")
+  
+  cat("ICU interaction quadratic model formula (centered version):\n")
+  cat(formula_str, "\n")
+  
+  # Estimate model
+  if("log_population" %in% names(data)) {
+    model <- fepois(as.formula(formula_str), 
+                    offset = ~log_population, 
+                    data = data)
+  } else {
+    model <- fepois(as.formula(formula_str), 
+                    data = data)
+  }
+  
+  cat("ICU interaction quadratic model estimation completed\n")
+  
+  # ===== Print detailed model results =====
+  cat("\n=== ICU Interaction Quadratic Model Detailed Results ===\n")
+  
+  # Print model summary
+  print(summary(model))
+  
+  # Extract and print temperature-related coefficients
+  cat("\n=== Temperature ICU Interaction Coefficient Details ===\n")
+  model_coef <- coef(model)
+  model_se <- se(model)
+  
+  # Find temperature-related coefficients
+  temp_coef_names <- temp_interaction_terms[temp_interaction_terms %in% names(model_coef)]
+  
+  if(length(temp_coef_names) > 0) {
+    temp_results <- data.frame(
+      Variable = temp_coef_names,
+      Coefficient = round(model_coef[temp_coef_names], 6),
+      Std_Error = round(model_se[temp_coef_names], 6),
+      t_value = round(model_coef[temp_coef_names] / model_se[temp_coef_names], 3),
+      p_value = round(2 * (1 - pnorm(abs(model_coef[temp_coef_names] / model_se[temp_coef_names]))), 4),
+      row.names = NULL
+    )
+    print(temp_results)
+  }
+  
+  # Calculate turning points (if quadratic coefficients exist)
+  cat("\n=== ICU Group Turning Point Analysis ===\n")
+  
+  # No ICU group turning point
+  if("temp_centered_no_icu" %in% temp_coef_names && "temp_centered_sq_no_icu" %in% temp_coef_names) {
+    temp_linear_no_icu <- model_coef["temp_centered_no_icu"]
+    temp_quad_no_icu <- model_coef["temp_centered_sq_no_icu"]
+    
+    if(!is.na(temp_quad_no_icu) && temp_quad_no_icu != 0) {
+      turning_point_no_icu_centered <- -temp_linear_no_icu / (2 * temp_quad_no_icu)
+      turning_point_no_icu_actual <- turning_point_no_icu_centered + reference_temp
+      
+      cat("No ICU group turning point:\n")
+      cat("  Centered scale turning point:", round(turning_point_no_icu_centered, 3), "\n")
+      cat("  Actual temperature turning point:", round(turning_point_no_icu_actual, 2), "°C\n")
+      cat("  Turning point nature:", ifelse(temp_quad_no_icu > 0, "Minimum point (U-shaped curve)", "Maximum point (Inverted U-shaped curve)"), "\n")
+    }
+  }
+  
+  # Has ICU group turning point
+  if("temp_centered_has_icu" %in% temp_coef_names && "temp_centered_sq_has_icu" %in% temp_coef_names) {
+    temp_linear_has_icu <- model_coef["temp_centered_has_icu"]
+    temp_quad_has_icu <- model_coef["temp_centered_sq_has_icu"]
+    
+    if(!is.na(temp_quad_has_icu) && temp_quad_has_icu != 0) {
+      turning_point_has_icu_centered <- -temp_linear_has_icu / (2 * temp_quad_has_icu)
+      turning_point_has_icu_actual <- turning_point_has_icu_centered + reference_temp
+      
+      cat("Has ICU group turning point:\n")
+      cat("  Centered scale turning point:", round(turning_point_has_icu_centered, 3), "\n")
+      cat("  Actual temperature turning point:", round(turning_point_has_icu_actual, 2), "°C\n")
+      cat("  Turning point nature:", ifelse(temp_quad_has_icu > 0, "Minimum point (U-shaped curve)", "Maximum point (Inverted U-shaped curve)"), "\n")
+    }
+  }
+  
+  # Print model fit statistics
+  cat("\n=== ICU Interaction Model Fit Statistics ===\n")
+  cat("AIC:", round(AIC(model), 2), "\n")
+  cat("BIC:", round(BIC(model), 2), "\n")
+  cat("Log-likelihood:", round(as.numeric(logLik(model)), 2), "\n")
+  cat("Number of observations:", nobs(model), "\n")
+  
+  # Verification at reference point
+  cat("\n=== Reference Point Verification ===\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("At reference point (T-T_ref=0):\n")
+  cat("  No ICU group linear term contribution: 0 * β1_no_icu = 0\n")
+  cat("  No ICU group quadratic term contribution: 0² * β2_no_icu = 0\n")
+  cat("  Has ICU group linear term contribution: 0 * β1_has_icu = 0\n")
+  cat("  Has ICU group quadratic term contribution: 0² * β2_has_icu = 0\n")
+  cat("  Total contribution: 0 (relative risk ratio should be 1.0)\n")
+  
+  cat("\n=== ICU Interaction Quadratic Model Results Output Completed ===\n")
+  
+  return(model)
+}
+
+##############################################################
+# 2. Calculate ICU interaction temperature marginal effects
+##############################################################
+calculate_icu_interaction_marginal_effects <- function(model, temp_range, reference_temp = 18.0, n_points = 100) {
+  
+  cat("\n=== Calculating ICU Interaction Temperature Marginal Effects ===\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  
+  # Get coefficients
+  coef_est <- coef(model)
+  vcov_matrix <- vcov(model)
+  
+  # Check if ICU interaction coefficients exist
+  required_coefs <- c("temp_centered_no_icu", "temp_centered_sq_no_icu",
+                      "temp_centered_has_icu", "temp_centered_sq_has_icu")
+  
+  missing_coefs <- required_coefs[!required_coefs %in% names(coef_est)]
+  if(length(missing_coefs) > 0) {
+    stop("ICU interaction coefficients not found in model: ", paste(missing_coefs, collapse = ", "))
+  }
+  
+  # Extract coefficients
+  temp_linear_no_icu <- coef_est["temp_centered_no_icu"]
+  temp_quad_no_icu <- coef_est["temp_centered_sq_no_icu"]
+  temp_linear_has_icu <- coef_est["temp_centered_has_icu"]
+  temp_quad_has_icu <- coef_est["temp_centered_sq_has_icu"]
+  
+  cat("No ICU group linear coefficient (β1_no_icu):", temp_linear_no_icu, "\n")
+  cat("No ICU group quadratic coefficient (β2_no_icu):", temp_quad_no_icu, "\n")
+  cat("Has ICU group linear coefficient (β1_has_icu):", temp_linear_has_icu, "\n")
+  cat("Has ICU group quadratic coefficient (β2_has_icu):", temp_quad_has_icu, "\n")
+  
+  # Create temperature sequence
+  temp_seq <- seq(temp_range[1], temp_range[2], length.out = n_points)
+  temp_seq_centered <- temp_seq - reference_temp  # Centered
+  
+  # Calculate marginal effects for each group (relative to reference temperature)
+  # No ICU group: f_no_icu(T) = β1_no_icu*(T-T_ref) + β2_no_icu*(T-T_ref)²
+  marginal_effect_no_icu <- temp_linear_no_icu * temp_seq_centered + temp_quad_no_icu * temp_seq_centered^2
+  relative_risk_no_icu <- exp(marginal_effect_no_icu)
+  
+  # Has ICU group: f_has_icu(T) = β1_has_icu*(T-T_ref) + β2_has_icu*(T-T_ref)²
+  marginal_effect_has_icu <- temp_linear_has_icu * temp_seq_centered + temp_quad_has_icu * temp_seq_centered^2
+  relative_risk_has_icu <- exp(marginal_effect_has_icu)
+  
+  # Verification: should be 1 at reference temperature
+  ref_idx <- which.min(abs(temp_seq - reference_temp))
+  cat("Verification at reference temperature:\n")
+  cat("  No ICU group marginal effect:", round(marginal_effect_no_icu[ref_idx], 6), ", RR:", round(relative_risk_no_icu[ref_idx], 6), "\n")
+  cat("  Has ICU group marginal effect:", round(marginal_effect_has_icu[ref_idx], 6), ", RR:", round(relative_risk_has_icu[ref_idx], 6), "\n")
+  
+  # Calculate confidence intervals - No ICU group
+  temp_var_no_icu <- vcov_matrix["temp_centered_no_icu", "temp_centered_no_icu"]
+  temp_sq_var_no_icu <- vcov_matrix["temp_centered_sq_no_icu", "temp_centered_sq_no_icu"]
+  temp_covar_no_icu <- vcov_matrix["temp_centered_no_icu", "temp_centered_sq_no_icu"]
+  
+  pred_var_no_icu <- temp_seq_centered^2 * temp_var_no_icu + 
+                     temp_seq_centered^4 * temp_sq_var_no_icu + 
+                     2 * temp_seq_centered^3 * temp_covar_no_icu
+  
+  pred_se_no_icu <- sqrt(pred_var_no_icu)
+  ci_lower_no_icu <- exp(marginal_effect_no_icu - 1.96 * pred_se_no_icu)
+  ci_upper_no_icu <- exp(marginal_effect_no_icu + 1.96 * pred_se_no_icu)
+  
+  # Calculate confidence intervals - Has ICU group
+  temp_var_has_icu <- vcov_matrix["temp_centered_has_icu", "temp_centered_has_icu"]
+  temp_sq_var_has_icu <- vcov_matrix["temp_centered_sq_has_icu", "temp_centered_sq_has_icu"]
+  temp_covar_has_icu <- vcov_matrix["temp_centered_has_icu", "temp_centered_sq_has_icu"]
+  
+  pred_var_has_icu <- temp_seq_centered^2 * temp_var_has_icu + 
+                      temp_seq_centered^4 * temp_sq_var_has_icu + 
+                      2 * temp_seq_centered^3 * temp_covar_has_icu
+  
+  pred_se_has_icu <- sqrt(pred_var_has_icu)
+  ci_lower_has_icu <- exp(marginal_effect_has_icu - 1.96 * pred_se_has_icu)
+  ci_upper_has_icu <- exp(marginal_effect_has_icu + 1.96 * pred_se_has_icu)
+  
+  # Calculate turning points
+  turning_point_no_icu <- ifelse(!is.na(temp_quad_no_icu) && temp_quad_no_icu != 0,
+                                 -temp_linear_no_icu / (2 * temp_quad_no_icu) + reference_temp, NA)
+  turning_point_has_icu <- ifelse(!is.na(temp_quad_has_icu) && temp_quad_has_icu != 0,
+                                  -temp_linear_has_icu / (2 * temp_quad_has_icu) + reference_temp, NA)
+  
+  if(!is.na(turning_point_no_icu)) {
+    cat("No ICU group turning point temperature:", round(turning_point_no_icu, 2), "°C\n")
+  }
+  if(!is.na(turning_point_has_icu)) {
+    cat("Has ICU group turning point temperature:", round(turning_point_has_icu, 2), "°C\n")
+  }
+  
+  # Organize results
+  results_no_icu <- data.frame(
+    temperature = temp_seq,
+    temperature_centered = temp_seq_centered,
+    ICU_status = "No_ICU",
+    marginal_effect = marginal_effect_no_icu,
+    relative_risk = relative_risk_no_icu,
+    prediction_se = pred_se_no_icu,
+    ci_lower = ci_lower_no_icu,
+    ci_upper = ci_upper_no_icu,
+    turning_point = turning_point_no_icu,
+    reference_temp = reference_temp,
+    stringsAsFactors = FALSE
+  )
+  
+  results_has_icu <- data.frame(
+    temperature = temp_seq,
+    temperature_centered = temp_seq_centered,
+    ICU_status = "Has_ICU",
+    marginal_effect = marginal_effect_has_icu,
+    relative_risk = relative_risk_has_icu,
+    prediction_se = pred_se_has_icu,
+    ci_lower = ci_lower_has_icu,
+    ci_upper = ci_upper_has_icu,
+    turning_point = turning_point_has_icu,
+    reference_temp = reference_temp,
+    stringsAsFactors = FALSE
+  )
+  
+  results <- rbind(results_no_icu, results_has_icu)
+  
+  cat("ICU interaction marginal effects calculation completed\n")
+  
+  return(results)
+}
+
+##############################################################
+# 3. Plot ICU interaction effects with stratified visualization
+##############################################################
+plot_icu_interaction_with_distribution <- function(results, temp_data, data, 
+                                                   save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("\n=== Creating ICU Interaction Effects Stratified Visualization ===\n")
+  
+  reference_temp <- unique(results$reference_temp)[1]
+  
+  # Define color scheme
+  no_icu_color <- "#e74c3c"        # Red series - No ICU
+  has_icu_color <- "#3498db"       # Blue series - Has ICU
+  ci_no_icu_color <- "#fadbd8"     # Light red confidence interval
+  ci_has_icu_color <- "#d5e8f7"    # Light blue confidence interval
+  hist_fill_color <- "#99ccee"     # Blue histogram
+  grid_color <- "#e6e6e6"          # Light gray grid lines
+  text_color <- "#333333"          # Dark gray text
+  mean_line_color <- "#0066cc"     # Blue mean line
+  ref_line_color <- "#ff69b4"      # Pink reference line
+  
+  # Determine plot size and layout parameters
+  layout_heights <- c(0.618, 0.382)  # Golden ratio
+  
+  # Create PNG image
+  png_file <- file.path(save_path, "temperature_icu_continuous_interaction.png")
+  png(filename = png_file, width = 14, height = 12, units = "in", res = 300)
+  
+  # Set layout
+  layout(matrix(c(1,2), nrow = 2, byrow = TRUE), heights = layout_heights)
+  
+  # Set plot parameters - Upper plot
+  par(mar = c(0, 5, 4, 2), cex.axis = 1.0, cex.lab = 1.2, family = "sans")
+  
+  # Upper plot: ICU interaction effects
+  rr_range <- range(c(results$relative_risk, results$ci_lower, results$ci_upper), na.rm = TRUE)
+  
+  # Adjust Y-axis range - Expand range to fully display confidence intervals
+  y_min <- max(min(rr_range[1] * 0.7), 0.05)  # Wider lower limit
+  y_max <- max(rr_range[2] * 1.5, 2.0)  # Remove upper limit restriction, ensure complete CI display
+  
+  plot(results$temperature, results$relative_risk, type = 'n', 
+       ylim = c(y_min, y_max),
+       xlim = range(results$temperature),
+       xlab = "", ylab = "", axes = FALSE, log = "y")
+  
+  # Add grid lines
+  temp_breaks <- pretty(results$temperature, n = 10)
+  
+  # Dynamically adjust Y-axis ticks to fit actual data range
+  if(y_max <= 5) {
+    y_breaks <- c(0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 3.0, 5.0)
+  } else if(y_max <= 15) {
+    y_breaks <- c(0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0)
+  } else if(y_max <= 30) {
+    y_breaks <- c(0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0)
+  } else {
+    y_breaks <- c(0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+  }
+  y_breaks <- y_breaks[y_breaks >= y_min * 0.8 & y_breaks <= y_max * 1.2]
+  
+  abline(h = y_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  abline(v = temp_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  
+  # Add reference lines
+  abline(h = 1, col = "gray40", lty = 2, lwd = 1.2)
+  abline(v = reference_temp, col = ref_line_color, lty = 2, lwd = 2)
+  
+  # Handle data for two ICU groups separately
+  no_icu_data <- results[results$ICU_status == "No_ICU", ]
+  has_icu_data <- results[results$ICU_status == "Has_ICU", ]
+  
+  # Add confidence intervals
+  polygon_x_no <- c(no_icu_data$temperature, rev(no_icu_data$temperature))
+  polygon_y_no <- c(no_icu_data$ci_lower, rev(no_icu_data$ci_upper))
+  polygon(polygon_x_no, polygon_y_no, col = add.alpha(ci_no_icu_color, 0.3), border = NA)
+  
+  polygon_x_has <- c(has_icu_data$temperature, rev(has_icu_data$temperature))
+  polygon_y_has <- c(has_icu_data$ci_lower, rev(has_icu_data$ci_upper))
+  polygon(polygon_x_has, polygon_y_has, col = add.alpha(ci_has_icu_color, 0.3), border = NA)
+  
+  # Draw main curves
+  lines(no_icu_data$temperature, no_icu_data$relative_risk, lwd = 3, col = no_icu_color)
+  lines(has_icu_data$temperature, has_icu_data$relative_risk, lwd = 3, col = has_icu_color)
+  
+  # Add reference point marker
+  ref_idx <- which.min(abs(no_icu_data$temperature - reference_temp))
+  points(no_icu_data$temperature[ref_idx], no_icu_data$relative_risk[ref_idx], 
+         col = "gray20", pch = 19, cex = 2.2)
+  
+  # Add turning point markers (if exist)
+  turning_points_no_icu <- unique(no_icu_data$turning_point)
+  turning_points_has_icu <- unique(has_icu_data$turning_point)
+  
+  if(!is.na(turning_points_no_icu[1])) {
+    tp_idx_no <- which.min(abs(no_icu_data$temperature - turning_points_no_icu[1]))
+    points(no_icu_data$temperature[tp_idx_no], no_icu_data$relative_risk[tp_idx_no], 
+           col = no_icu_color, pch = 17, cex = 1.8)
+  }
+  
+  if(!is.na(turning_points_has_icu[1])) {
+    tp_idx_has <- which.min(abs(has_icu_data$temperature - turning_points_has_icu[1]))
+    points(has_icu_data$temperature[tp_idx_has], has_icu_data$relative_risk[tp_idx_has], 
+           col = has_icu_color, pch = 17, cex = 1.8)
+  }
+  
+  # Add Y-axis
+  axis(2, at = y_breaks, labels = as.character(y_breaks), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Relative Risk Ratio (95% CI)", side = 2, line = 3.5, cex = 1.2, col = text_color)
+  
+  # Add legend - Move to upper left corner
+  legend("topleft", 
+         legend = c("No ICU Areas", "Has ICU Areas", "Reference Point(18°C)", "Turning Points"), 
+         col = c(no_icu_color, has_icu_color, "gray20", "gray40"),
+         pch = c(NA, NA, 19, 17), 
+         lwd = c(3, 3, NA, NA),
+         cex = 1.0,
+         bg = "white",
+         box.col = "gray80")
+  
+  # Add title
+  mtext("Temperature-Dengue Risk ICU Interaction Effects Based on Continuous Quadratic Model", 
+        side = 3, line = 1, cex = 1.4, font = 2, col = text_color)
+  
+  # Lower plot: Temperature frequency distribution histogram
+  par(mar = c(4.5, 5, 0.5, 2))
+  
+  # Filter temperature data to display range
+  temp_filtered <- temp_data[temp_data >= min(results$temperature) & 
+                               temp_data <= max(results$temperature)]
+  
+  # Create histogram
+  actual_min <- min(temp_filtered, na.rm = TRUE)
+  actual_max <- max(temp_filtered, na.rm = TRUE)
+  hist_breaks <- seq(floor(actual_min), ceiling(actual_max), by = 0.8)
+  
+  hist_result <- hist(temp_filtered, breaks = hist_breaks, plot = FALSE)
+  hist_percent <- hist_result$counts / sum(hist_result$counts) * 100
+  
+  # Draw histogram
+  plot(1, 1, type = "n", 
+       xlim = range(results$temperature), 
+       ylim = c(0, max(hist_percent) * 1.2), 
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # Add bars
+  for(i in 1:length(hist_percent)) {
+    if(hist_breaks[i] <= max(results$temperature) && 
+       hist_breaks[i+1] >= min(results$temperature)) {
+      rect(hist_breaks[i], 0, hist_breaks[i+1], hist_percent[i], 
+           col = add.alpha(hist_fill_color, 0.6), 
+           border = add.alpha("gray80", 0.4))
+    }
+  }
+  
+  # Add X-axis
+  axis(1, at = temp_breaks, labels = temp_breaks, col.axis = text_color, col = "gray70")
+  mtext("Temperature (°C)", side = 1, line = 3, cex = 1.2, col = text_color)
+  
+  # Add reference line and mean line
+  abline(v = reference_temp, col = ref_line_color, lty = 2, lwd = 2)
+  temp_mean <- mean(temp_filtered, na.rm = TRUE)
+  abline(v = temp_mean, col = mean_line_color, lty = 1, lwd = 1.5)
+  
+  # Add Y-axis
+  y_ticks <- pretty(c(0, max(hist_percent)), n = 5)
+  axis(2, at = y_ticks, labels = paste0(format(y_ticks, digits = 1), "%"), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Sample Distribution\nFrequency (%)", side = 2, line = 2.8, cex = 1.2, col = text_color)
+  
+  # Add statistical information
+  text(temp_mean, max(hist_percent) * 0.9, 
+       sprintf("Mean: %.1f°C", temp_mean), 
+       cex = 0.9, col = mean_line_color)
+  
+  text(reference_temp, max(hist_percent) * 0.8, 
+       sprintf("Reference: %.1f°C", reference_temp), 
+       cex = 0.9, col = ref_line_color)
+  
+  # Add border
+  box(col = "gray70")
+  
+  dev.off()
+  
+  cat("ICU interaction effects stratified plot saved to:", png_file, "\n")
+  
+  return(png_file)
+}
+
+##############################################################
+# 4. Create ICU interaction effects forest plot (based on specific temperature points from continuous model)
+##############################################################
+create_continuous_icu_forest_plot <- function(results, temp_points = NULL, 
+                                               save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("\n=== Creating Continuous Model ICU Interaction Effects Forest Plot ===\n")
+  
+  reference_temp <- unique(results$reference_temp)[1]
+  
+  # If temperature points not specified, select representative temperature points
+  if(is.null(temp_points)) {
+    temp_range <- range(results$temperature)
+    temp_points <- c(
+      temp_range[1],                    # Minimum temperature
+      quantile(results$temperature, 0.25),  # 25th percentile
+      reference_temp,                   # Reference temperature
+      quantile(results$temperature, 0.75),  # 75th percentile
+      temp_range[2]                     # Maximum temperature
+    )
+    temp_points <- round(temp_points, 1)
+  }
+  
+  cat("Selected representative temperature points:", paste(temp_points, collapse = ", "), "°C\n")
+  
+  # Extract data for each temperature point
+  forest_data <- data.frame()
+  
+  for(temp in temp_points) {
+    # Find closest temperature point
+    for(icu_status in c("No_ICU", "Has_ICU")) {
+      subset_data <- results[results$ICU_status == icu_status, ]
+      closest_idx <- which.min(abs(subset_data$temperature - temp))
+      
+      point_data <- subset_data[closest_idx, ]
+      
+      forest_data <- rbind(forest_data, data.frame(
+        temperature_target = temp,
+        temperature_actual = point_data$temperature,
+        ICU_status = icu_status,
+        relative_risk = point_data$relative_risk,
+        ci_lower = point_data$ci_lower,
+        ci_upper = point_data$ci_upper,
+        is_reference = abs(point_data$temperature - reference_temp) < 0.5,
+        color_group = ifelse(icu_status == "No_ICU", "No ICU Areas", "Has ICU Areas"),
+        temp_label = paste0(temp, "°C"),
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  # Define colors
+  colors <- c("No ICU Areas" = "#e74c3c", "Has ICU Areas" = "#3498db")
+  
+  # Create forest plot
+  forest_plot <- ggplot(forest_data, aes(x = relative_risk, y = reorder(temp_label, temperature_target))) +
+    
+    # Add reference line
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", size = 0.8) +
+    
+    # Add confidence interval line segments
+    geom_segment(aes(x = ci_lower, xend = ci_upper, y = temp_label, yend = temp_label, color = color_group),
+                 size = 1.5, alpha = 0.8, position = position_dodge(width = 0.4)) +
+    
+    # Add point estimates
+    geom_point(aes(color = color_group, shape = color_group), 
+               size = 3.5, stroke = 1.2, position = position_dodge(width = 0.4)) +
+    
+    # Faceted display by ICU status
+    facet_wrap(~ color_group, ncol = 2, scales = "free_y") +
+    
+    # Use log scale
+    scale_x_log10(
+      breaks = c(0.1, 0.2, 0.5, 1, 2, 5, 10, 20),
+      labels = c("0.1", "0.2", "0.5", "1.0", "2.0", "5.0", "10.0", "20.0"),
+      limits = c(0.1, 25)
+    ) +
+    
+    # Set colors and shapes
+    scale_color_manual(values = colors) +
+    scale_shape_manual(values = c(16, 17)) +
+    
+    # Set theme
+    theme_minimal() +
+    theme(
+      text = element_text(family = "sans", color = "#333333"),
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5, margin = margin(b = 20)),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray60"),
+      axis.title.x = element_text(size = 12, margin = margin(t = 15)),
+      axis.title.y = element_text(size = 12, margin = margin(r = 15)),
+      axis.text = element_text(size = 10),
+      strip.text = element_text(size = 12, face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line(color = "gray90", size = 0.5),
+      panel.grid.major.x = element_line(color = "gray90", size = 0.5),
+      legend.position = "none",
+      plot.margin = margin(20, 20, 20, 20)
+    ) +
+    
+    # Set labels
+    labs(
+      title = "Temperature-Dengue Risk ICU Interaction Effects Forest Plot Based on Continuous Quadratic Model",
+      subtitle = paste0("Reference temperature: ", reference_temp, "°C, Selected representative temperature points"),
+      x = "Relative Risk Ratio (95% Confidence Interval, Log Scale)",
+      y = "Temperature Points"
+    )
+  
+  # Save forest plot
+  forest_file <- file.path(save_path, "temperature_icu_continuous_forest_plot.png")
+  ggsave(forest_file, forest_plot, width = 16, height = 10, dpi = 300, bg = "white")
+  
+  cat("Continuous model ICU interaction forest plot saved to:", forest_file, "\n")
+  
+  return(list(plot = forest_plot, file = forest_file, data = forest_data))
+}
+
+##############################################################
+# 5. ICU protection effect calculation (continuous model version)
+##############################################################
+calculate_continuous_icu_protection <- function(results, temp_points = NULL) {
+  
+  cat("\n=== Continuous Model ICU Protection Effect Analysis ===\n")
+  
+  reference_temp <- unique(results$reference_temp)[1]
+  
+  # If temperature points not specified, select representative temperature points
+  if(is.null(temp_points)) {
+    temp_range <- range(results$temperature)
+    temp_points <- c(
+      temp_range[1],                    # Minimum temperature
+      quantile(results$temperature, 0.25),  # 25th percentile
+      reference_temp,                   # Reference temperature
+      quantile(results$temperature, 0.75),  # 75th percentile
+      temp_range[2]                     # Maximum temperature
+    )
+    temp_points <- round(temp_points, 1)
+  }
+  
+  protection_results <- data.frame()
+  
+  for(temp in temp_points) {
+    # Find closest temperature point
+    no_icu_subset <- results[results$ICU_status == "No_ICU", ]
+    has_icu_subset <- results[results$ICU_status == "Has_ICU", ]
+    
+    no_icu_idx <- which.min(abs(no_icu_subset$temperature - temp))
+    has_icu_idx <- which.min(abs(has_icu_subset$temperature - temp))
+    
+    no_icu_rr <- no_icu_subset$relative_risk[no_icu_idx]
+    has_icu_rr <- has_icu_subset$relative_risk[has_icu_idx]
+    
+    # Protection effect = (No ICU risk - Has ICU risk) / No ICU risk * 100
+    protection_effect <- (no_icu_rr - has_icu_rr) / no_icu_rr * 100
+    
+    protection_results <- rbind(protection_results, data.frame(
+      temperature = temp,
+      no_icu_rr = no_icu_rr,
+      has_icu_rr = has_icu_rr,
+      protection_effect_pct = protection_effect,
+      is_reference = abs(temp - reference_temp) < 0.5
+    ))
+  }
+  
+  cat("ICU protection effects at various temperature points (continuous model):\n")
+  print(protection_results)
+  
+  return(protection_results)
+}
+
+##############################################################
+# 6. Main analysis function - Continuous quadratic ICU interaction model
+##############################################################
+run_continuous_icu_interaction_analysis <- function(data_clean, reference_temp = 18.0,
+                                                     temp_points = NULL,
+                                                     save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("=== Starting Continuous Quadratic ICU Interaction Effect Analysis ===\n")
+  cat("Original data rows:", nrow(data_clean), "\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("Plot save path:", save_path, "\n")
+  
+  # Ensure save path exists
+  if(!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+    cat("Created save path:", save_path, "\n")
+  }
+  
+  # Step 1: Filter extreme data
+  data_filtered <- filter_extreme_temperatures(data_clean)
+  
+  # Step 2: Estimate centered quadratic model with ICU interaction terms
+  model_icu_interaction <- estimate_quadratic_icu_interaction_model(data_filtered, reference_temp)
+  
+  # Step 3: Calculate ICU interaction temperature marginal effects
+  temp_range <- range(data_filtered$temperature_mean, na.rm = TRUE)
+  pred_icu_interaction <- calculate_icu_interaction_marginal_effects(
+    model_icu_interaction, temp_range, reference_temp)
+  
+  # Step 4: Calculate ICU protection effects
+  icu_protection <- calculate_continuous_icu_protection(pred_icu_interaction, temp_points)
+  
+  # Step 5: Create stratified visualization
+  layered_plot_file <- plot_icu_interaction_with_distribution(
+    results = pred_icu_interaction,
+    temp_data = data_filtered$temperature_mean,
+    data = data_filtered,
+    save_path = save_path
+  )
+  
+  # Step 6: Create forest plot
+  forest_result <- create_continuous_icu_forest_plot(
+    results = pred_icu_interaction,
+    temp_points = temp_points,
+    save_path = save_path
+  )
+  
+  # Results verification
+  ref_results <- pred_icu_interaction[abs(pred_icu_interaction$temperature - reference_temp) < 0.5, ]
+  cat("\n=== Reference Point Verification (Continuous Model) ===\n")
+  cat("Reference point risk ratios should be close to 1.0:\n")
+  if(nrow(ref_results) > 0) {
+    print(ref_results[, c("ICU_status", "temperature", "relative_risk")])
+  }
+  
+  # Show extreme value analysis
+  cat("\n=== Continuous Model Extreme Value Analysis ===\n")
+  
+  no_icu_results <- pred_icu_interaction[pred_icu_interaction$ICU_status == "No_ICU", ]
+  has_icu_results <- pred_icu_interaction[pred_icu_interaction$ICU_status == "Has_ICU", ]
+  
+  # Highest risk points
+  max_risk_no_icu_idx <- which.max(no_icu_results$relative_risk)
+  max_risk_has_icu_idx <- which.max(has_icu_results$relative_risk)
+  
+  cat("No ICU group highest risk:\n")
+  cat("  Temperature:", round(no_icu_results$temperature[max_risk_no_icu_idx], 1), "°C\n")
+  cat("  Risk ratio:", round(no_icu_results$relative_risk[max_risk_no_icu_idx], 2), "\n")
+  
+  cat("Has ICU group highest risk:\n")
+  cat("  Temperature:", round(has_icu_results$temperature[max_risk_has_icu_idx], 1), "°C\n")
+  cat("  Risk ratio:", round(has_icu_results$relative_risk[max_risk_has_icu_idx], 2), "\n")
+  
+  # Temperature range analysis
+  cat("\n=== Temperature Range Analysis After Filtering ===\n")
+  original_temp_range <- range(data_clean$temperature_mean, na.rm = TRUE)
+  filtered_temp_range <- range(data_filtered$temperature_mean, na.rm = TRUE)
+  
+  cat("Original temperature range:", round(original_temp_range, 1), "°C\n")
+  cat("Filtered temperature range:", round(filtered_temp_range, 1), "°C\n")
+  cat("Removed data percentage:", round((nrow(data_clean) - nrow(data_filtered))/nrow(data_clean)*100, 1), "%\n")
+  
+  # Model fit quality
+  cat("\n=== Continuous Model Quality Assessment ===\n")
+  model_aic <- AIC(model_icu_interaction)
+  cat("Model AIC:", format(model_aic, scientific = FALSE), "\n")
+  cat("Number of model coefficients:", length(coef(model_icu_interaction)), "\n")
+  cat("Number of ICU interaction terms: 4 (linear×2 + quadratic×2)\n")
+  
+  # Significance statistics
+  coef_summary <- summary(model_icu_interaction)
+  icu_coefs <- coef_summary$coefficients[grepl("temp_centered.*icu", rownames(coef_summary$coefficients)), ]
+  significant_icu_coefs <- sum(icu_coefs[, "Pr(>|z|)"] < 0.05, na.rm = TRUE)
+  
+  cat("Significant ICU interaction terms:", significant_icu_coefs, "out of", 
+      nrow(icu_coefs), "\n")
+  
+  cat("\n=== Continuous Quadratic ICU Interaction Analysis Completed ===\n")
+  cat("Generated plot files:\n")
+  cat("1. Stratified interaction plot:", layered_plot_file, "\n")
+  cat("2. Forest plot:", forest_result$file, "\n")
+  
+  return(list(
+    model = model_icu_interaction,
+    predictions = pred_icu_interaction,
+    icu_protection = icu_protection,
+    forest_plot = forest_result$plot,
+    forest_file = forest_result$file,
+    forest_data = forest_result$data,
+    layered_plot_file = layered_plot_file,
+    reference_temp = reference_temp,
+    data_original = data_clean,
+    data_filtered = data_filtered,
+    original_temp_range = original_temp_range,
+    filtered_temp_range = filtered_temp_range,
+    save_path = save_path,
+    model_aic = model_aic,
+    significant_icu_coefs = significant_icu_coefs,
+    temp_points_used = temp_points
+  ))
+}
+
+##############################################################
+# 7. Data requirements check function
+##############################################################
+check_icu_data_requirements <- function(data) {
+  
+  cat("=== ICU Interaction Data Requirements Check ===\n")
+  
+  required_vars <- c("temperature_mean", "cases", "ICU_binary", 
+                     "humidity_mean", "pressure_mean", "wind_speed_mean",
+                     "cityid", "year_month", "log_population")
+  
+  missing_vars <- required_vars[!required_vars %in% names(data)]
+  
+  if(length(missing_vars) > 0) {
+    cat("Missing variables:", paste(missing_vars, collapse = ", "), "\n")
+    cat("Please ensure data contains all the above variables\n")
+    return(FALSE)
+  }
+  
+  cat("✓ All required variables exist\n")
+  
+  # Check ICU variable
+  if("ICU_binary" %in% names(data)) {
+    icu_levels <- unique(data$ICU_binary)
+    icu_counts <- table(data$ICU_binary)
+    cat("ICU_binary levels:", paste(icu_levels, collapse = ", "), "\n")
+    cat("ICU_binary distribution:\n")
+    print(icu_counts)
+    
+    if(length(icu_levels) != 2 || !all(c("No_ICU", "Has_ICU") %in% icu_levels)) {
+      cat("Warning: ICU_binary should contain 'No_ICU' and 'Has_ICU' levels\n")
+    }
+  }
+  
+  # Check land use variables
+  landuse_vars <- c("forest", "farming", "urban")
+  available_landuse <- landuse_vars[landuse_vars %in% names(data)]
+  
+  if(length(available_landuse) > 0) {
+    cat("Available land use control variables:", paste(available_landuse, collapse = ", "), "\n")
+  } else {
+    cat("Warning: No land use variables found, will use only basic control variables\n")
+  }
+  
+  # Check data completeness
+  for(var in required_vars) {
+    na_count <- sum(is.na(data[[var]]))
+    if(na_count > 0) {
+      cat("Warning:", var, "has", na_count, "missing values\n")
+    }
+  }
+  
+  # Check temperature range
+  temp_range <- range(data$temperature_mean, na.rm = TRUE)
+  cat("Temperature range:", round(temp_range[1], 1), "to", round(temp_range[2], 1), "°C\n")
+  
+  # Check sample size adequacy
+  min_samples_needed <- 1000  # Minimum sample size needed for continuous model
+  actual_samples <- nrow(data)
+  
+  if(actual_samples < min_samples_needed) {
+    cat("Warning: Sample size may be insufficient, recommend at least", min_samples_needed, "rows of data\n")
+    cat("Current sample size:", actual_samples, "rows\n")
+  } else {
+    cat("✓ Sample size adequate, supports continuous quadratic interaction analysis\n")
+    cat("Current sample size:", actual_samples, "rows\n")
+  }
+  
+  cat("ICU interaction data check completed\n\n")
+  return(TRUE)
+}
+
+##############################################################
+# 8. Continuous model results interpretation function
+##############################################################
+interpret_continuous_icu_results <- function(results) {
+  
+  cat("=== Continuous Quadratic ICU Interaction Results Interpretation ===\n")
+  
+  # Group by ICU status
+  no_icu_results <- results$predictions[results$predictions$ICU_status == "No_ICU", ]
+  has_icu_results <- results$predictions[results$predictions$ICU_status == "Has_ICU", ]
+  
+  # Find temperature points with highest and lowest risk
+  cat("No ICU areas risk analysis:\n")
+  max_risk_no_icu_idx <- which.max(no_icu_results$relative_risk)
+  min_risk_no_icu_idx <- which.min(no_icu_results$relative_risk)
+  
+  cat("  Highest risk temperature:", round(no_icu_results$temperature[max_risk_no_icu_idx], 1), 
+      "°C, RR=", round(no_icu_results$relative_risk[max_risk_no_icu_idx], 2), "\n")
+  cat("  Lowest risk temperature:", round(no_icu_results$temperature[min_risk_no_icu_idx], 1), 
+      "°C, RR=", round(no_icu_results$relative_risk[min_risk_no_icu_idx], 2), "\n")
+  
+  cat("\nHas ICU areas risk analysis:\n")
+  max_risk_has_icu_idx <- which.max(has_icu_results$relative_risk)
+  min_risk_has_icu_idx <- which.min(has_icu_results$relative_risk)
+  
+  cat("  Highest risk temperature:", round(has_icu_results$temperature[max_risk_has_icu_idx], 1), 
+      "°C, RR=", round(has_icu_results$relative_risk[max_risk_has_icu_idx], 2), "\n")
+  cat("  Lowest risk temperature:", round(has_icu_results$temperature[min_risk_has_icu_idx], 1), 
+      "°C, RR=", round(has_icu_results$relative_risk[min_risk_has_icu_idx], 2), "\n")
+  
+  # ICU protection effect analysis
+  cat("\nICU protection effect analysis:\n")
+  protection_stats <- results$icu_protection
+  max_protection_idx <- which.max(protection_stats$protection_effect_pct)
+  min_protection_idx <- which.min(protection_stats$protection_effect_pct)
+  
+  cat("  Maximum protection effect temperature:", protection_stats$temperature[max_protection_idx], 
+      "°C, protection effect=", round(protection_stats$protection_effect_pct[max_protection_idx], 1), "%\n")
+  cat("  Minimum protection effect temperature:", protection_stats$temperature[min_protection_idx], 
+      "°C, protection effect=", round(protection_stats$protection_effect_pct[min_protection_idx], 1), "%\n")
+  
+  # Turning point analysis
+  cat("\nTurning point analysis:\n")
+  turning_points_no_icu <- unique(no_icu_results$turning_point)
+  turning_points_has_icu <- unique(has_icu_results$turning_point)
+  
+  if(!is.na(turning_points_no_icu[1])) {
+    cat("  No ICU group turning point:", round(turning_points_no_icu[1], 1), "°C\n")
+  } else {
+    cat("  No ICU group: No clear turning point\n")
+  }
+  
+  if(!is.na(turning_points_has_icu[1])) {
+    cat("  Has ICU group turning point:", round(turning_points_has_icu[1], 1), "°C\n")
+  } else {
+    cat("  Has ICU group: No clear turning point\n")
+  }
+  
+  # Statistical significance analysis
+  cat("\nStatistical significance analysis:\n")
+  cat("  Model AIC:", format(results$model_aic, scientific = FALSE), "\n")
+  cat("  Significant ICU interaction terms:", results$significant_icu_coefs, "out of 4\n")
+  cat("  Sample size:", nrow(results$data_filtered), "rows\n")
+  
+  # Critical temperature threshold identification
+  cat("\nCritical temperature threshold identification:\n")
+  
+  # High risk threshold (RR > 2.0)
+  high_risk_temps_no_icu <- no_icu_results$temperature[no_icu_results$relative_risk > 2.0]
+  high_risk_temps_has_icu <- has_icu_results$temperature[has_icu_results$relative_risk > 2.0]
+  
+  if(length(high_risk_temps_no_icu) > 0) {
+    cat("  High risk temperature threshold (No ICU): ≥", round(min(high_risk_temps_no_icu), 1), "°C\n")
+  }
+  
+  if(length(high_risk_temps_has_icu) > 0) {
+    cat("  High risk temperature threshold (Has ICU): ≥", round(min(high_risk_temps_has_icu), 1), "°C\n")
+  }
+  
+  # Continuous model vs binned model comparison advantages
+  cat("\nContinuous model advantages:\n")
+  cat("  ✓ Smooth temperature-risk relationship curves\n")
+  cat("  ✓ Risk estimation at any temperature point\n")
+  cat("  ✓ Clear mathematical function form\n")
+  cat("  ✓ Precise turning point calculation\n")
+  cat("  ✓ Reduces information loss from binning\n")
+  
+  cat("\n=== Continuous Quadratic ICU Interaction Results Interpretation Completed ===\n")
+}
+
+##############################################################
+# Usage examples and instructions
+##############################################################
+
+# Main analysis function call example
+if(exists("data_clean")) {
+  
+  cat("=== Detected data_clean dataset (Continuous ICU Interaction Version) ===\n")
+  
+  # Data check
+  if(check_icu_data_requirements(data_clean)) {
+    
+    # Run continuous quadratic ICU interaction analysis
+    cat("Starting continuous quadratic ICU interaction effect analysis...\n")
+    results_continuous_icu <- run_continuous_icu_interaction_analysis(
+      data_clean, 
+      reference_temp = 18.0,  # Reference temperature set to 18°C
+      temp_points = c(12, 15, 18, 21, 24, 27, 30),  # Optional: specify specific temperature points for forest plot
+      save_path = "C:/Users/a1230/Desktop/picture"
+    )
+    
+    cat("\n=== Continuous Quadratic ICU Interaction Analysis Completed ===\n")
+    cat("Available results:\n")
+    cat("- results_continuous_icu$model: ICU interaction quadratic model object\n")
+    cat("- results_continuous_icu$predictions: Continuous ICU interaction prediction results\n")
+    cat("- results_continuous_icu$icu_protection: ICU protection effect analysis\n")
+    cat("- results_continuous_icu$forest_plot: Forest plot ggplot object\n")
+    cat("- results_continuous_icu$forest_file: Forest plot file path\n")
+    cat("- results_continuous_icu$layered_plot_file: Stratified plot file path\n")
+    cat("- results_continuous_icu$data_original: Original data\n")
+    cat("- results_continuous_icu$data_filtered: Filtered data\n")
+    cat("- results_continuous_icu$original_temp_range: Original temperature range\n")
+    cat("- results_continuous_icu$filtered_temp_range: Filtered temperature range\n")
+    cat("- results_continuous_icu$model_aic: Model AIC value\n")
+    cat("- results_continuous_icu$significant_icu_coefs: Number of significant ICU interaction terms\n")
+    
+    # Show key results summary of continuous model
+    cat("\n=== Continuous Model Key Results Summary ===\n")
+    no_icu_data <- results_continuous_icu$predictions[results_continuous_icu$predictions$ICU_status == "No_ICU", ]
+    has_icu_data <- results_continuous_icu$predictions[results_continuous_icu$predictions$ICU_status == "Has_ICU", ]
+    
+    # Find highest risk points
+    max_no_icu_idx <- which.max(no_icu_data$relative_risk)
+    max_has_icu_idx <- which.max(has_icu_data$relative_risk)
+    
+    cat("No ICU group highest risk: ", round(no_icu_data$temperature[max_no_icu_idx], 1), "°C, RR=", 
+        round(no_icu_data$relative_risk[max_no_icu_idx], 2), "\n")
+    cat("Has ICU group highest risk: ", round(has_icu_data$temperature[max_has_icu_idx], 1), "°C, RR=", 
+        round(has_icu_data$relative_risk[max_has_icu_idx], 2), "\n")
+    
+    # Show protection effects
+    protection_summary <- results_continuous_icu$icu_protection
+    avg_protection <- mean(protection_summary$protection_effect_pct, na.rm = TRUE)
+    cat("Average ICU protection effect: ", round(avg_protection, 1), "%\n")
+    
+    # Show turning point information
+    turning_point_no_icu <- unique(no_icu_data$turning_point)[1]
+    turning_point_has_icu <- unique(has_icu_data$turning_point)[1]
+    
+    if(!is.na(turning_point_no_icu)) {
+      cat("No ICU group turning point: ", round(turning_point_no_icu, 1), "°C\n")
+    }
+    if(!is.na(turning_point_has_icu)) {
+      cat("Has ICU group turning point: ", round(turning_point_has_icu, 1), "°C\n")
+    }
+    
+    # Model quality information
+    cat("\n=== Model Quality Assessment ===\n")
+    cat("Data filtering percentage: ", round((nrow(results_continuous_icu$data_original) - 
+        nrow(results_continuous_icu$data_filtered))/nrow(results_continuous_icu$data_original)*100, 1), "%\n")
+    cat("Model AIC: ", format(results_continuous_icu$model_aic, scientific = FALSE), "\n")
+    cat("Significant ICU interaction terms: ", results_continuous_icu$significant_icu_coefs, "/4\n")
+    cat("Temperature range (after filtering): ", round(results_continuous_icu$filtered_temp_range, 1), "°C\n")
+    
+    # Comparison recommendations between continuous and binned models
+    cat("\n=== Continuous vs Binned Model Recommendations ===\n")
+    cat("✓ Continuous model advantages: smooth curves, precise turning points, any temperature prediction\n")
+    cat("✓ Binned model advantages: easier interpretation, policy-friendly, better stability\n")
+    cat("✓ Recommendation: use continuous model for mechanism exploration, binned model for policy making\n")
+    cat("✓ If both models yield consistent results, conclusions are robust and reliable\n")
+    
+    # Interpret results
+    interpret_continuous_icu_results(results_continuous_icu)
+    
+  } else {
+    cat("Data check failed, please check data format\n")
+    cat("Common issues:\n")
+    cat("1. ICU_binary variable should contain 'No_ICU' and 'Has_ICU' levels\n")
+    cat("2. Ensure all required variables exist without too many missing values\n")
+    cat("3. Temperature data should be numeric with reasonable range\n")
+    cat("4. Sample size should be large enough (recommend >1000 rows)\n")
+  }
+  
+} else {
+  
+  cat("=== Usage Instructions (Continuous Quadratic ICU Interaction Version V4.0) ===\n")
+  cat("Please first prepare data_clean dataset containing the following variables:\n\n")
+  cat("Required variables:\n")
+  cat("- temperature_mean: Mean temperature (numeric)\n")
+  cat("- cases: Number of cases (integer)\n") 
+  cat("- ICU_binary: ICU resource status (factor: 'No_ICU'/'Has_ICU')\n")
+  cat("- humidity_mean: Mean humidity (numeric)\n")
+  cat("- pressure_mean: Mean pressure (numeric)\n")
+  cat("- wind_speed_mean: Mean wind speed (numeric)\n")
+  cat("- cityid: City ID (factor)\n")
+  cat("- year_month: Year-month (factor)\n")
+  cat("- log_population: Population log (numeric)\n\n")
+  
+  cat("Optional control variables (recommended):\n")
+  cat("- forest: Forest coverage (numeric, 0-1)\n")
+  cat("- farming: Agricultural land proportion (numeric, 0-1)\n")
+  cat("- urban: Urbanization proportion (numeric, 0-1)\n")
+  cat("- hospital: Hospital resources (numeric)\n")
+  cat("- log_pop_density: Population density log (numeric)\n\n")
+  
+  cat("Standard usage workflow:\n")
+  cat("# 1. Check data requirements\n")
+  cat("check_icu_data_requirements(data_clean)\n\n")
+  
+  cat("# 2. Run complete continuous quadratic ICU interaction analysis\n")
+  cat("results_continuous_icu <- run_continuous_icu_interaction_analysis(\n")
+  cat("  data_clean = data_clean,\n")
+  cat("  reference_temp = 18.0,  # Reference temperature 18°C (adjustable)\n")
+  cat("  temp_points = c(12, 15, 18, 21, 24, 27, 30),  # Forest plot temperature points (optional)\n")
+  cat("  save_path = 'C:/Users/a1230/Desktop/picture'  # Plot save path\n")
+  cat(")\n\n")
+  
+  cat("# 3. View and interpret results\n")
+  cat("# View prediction results table\n")
+  cat("head(results_continuous_icu$predictions)\n\n")
+  cat("# View ICU protection effects\n")
+  cat("print(results_continuous_icu$icu_protection)\n\n")
+  cat("# Automatic results interpretation\n")
+  cat("interpret_continuous_icu_results(results_continuous_icu)\n\n")
+  
+  cat("# 4. Individual function usage (advanced users)\n")
+  cat("# Data filtering\n")
+  cat("data_filtered <- filter_extreme_temperatures(data_clean)\n\n")
+  cat("# Model estimation\n")
+  cat("model <- estimate_quadratic_icu_interaction_model(data_filtered, 18.0)\n\n")
+  cat("# Prediction calculation\n")
+  cat("temp_range <- range(data_filtered$temperature_mean, na.rm=TRUE)\n")
+  cat("predictions <- calculate_icu_interaction_marginal_effects(model, temp_range, 18.0)\n\n")
+  
+  cat("Expected outputs:\n")
+  cat("📊 Plot files:\n")
+  cat("  - temperature_icu_continuous_interaction.png: ICU interaction stratified plot\n")
+  cat("  - temperature_icu_continuous_forest_plot.png: Representative temperature points forest plot\n\n")
+  cat("📋 Data results:\n")
+  cat("  - Continuous temperature-risk relationship curves (two ICU group curves)\n")
+  cat("  - Precise turning point temperatures for each ICU group\n")
+  cat("  - ICU protection effects at different temperature points\n")
+  cat("  - Statistical significance test results\n")
+  cat("  - Model fit quality indicators\n\n")
+  
+}
+
+##############################################################
+# Supplement: Quick results comparison function
+##############################################################
+compare_continuous_vs_binned_results <- function(continuous_results, binned_results = NULL) {
+  
+  cat("=== Continuous Model vs Binned Model Results Comparison ===\n")
+  
+  if(is.null(binned_results)) {
+    cat("No binned model results provided, showing continuous model summary only\n\n")
+    
+    cat("Continuous model key findings:\n")
+    interpret_continuous_icu_results(continuous_results)
+    
+  } else {
+    cat("Comparing results from both models...\n")
+    
+    # Compare model fit quality
+    cat("\nModel fit quality comparison:\n")
+    cat("Continuous model AIC:", format(continuous_results$model_aic, scientific = FALSE), "\n")
+    
+    if("model_aic" %in% names(binned_results)) {
+      cat("Binned model AIC:", format(binned_results$model_aic, scientific = FALSE), "\n")
+      aic_diff <- continuous_results$model_aic - binned_results$model_aic
+      cat("AIC difference:", format(aic_diff, scientific = FALSE), 
+          ifelse(aic_diff < 0, " (continuous model better)", " (binned model better)"), "\n")
+    }
+    
+    # Compare significance
+    cat("\nStatistical significance comparison:\n")
+    cat("Continuous model significant ICU interaction terms:", continuous_results$significant_icu_coefs, "/4\n")
+    
+    if("significant_coefs" %in% names(binned_results)) {
+      cat("Binned model significant ICU interaction terms:", binned_results$significant_coefs, "\n")
+    }
+    
+    # Compare highest risk points
+    cat("\nHighest risk point comparison:\n")
+    no_icu_cont <- continuous_results$predictions[continuous_results$predictions$ICU_status == "No_ICU", ]
+    max_idx_cont <- which.max(no_icu_cont$relative_risk)
+    
+    cat("Continuous model (No ICU group) highest risk: ", 
+        round(no_icu_cont$temperature[max_idx_cont], 1), "°C, RR=", 
+        round(no_icu_cont$relative_risk[max_idx_cont], 2), "\n")
+    
+    if("predictions" %in% names(binned_results)) {
+      no_icu_bin <- binned_results$predictions[binned_results$predictions$ICU_status == "No_ICU", ]
+      if(nrow(no_icu_bin) > 0) {
+        max_idx_bin <- which.max(no_icu_bin$relative_risk)
+        cat("Binned model (No ICU group) highest risk: ", 
+            no_icu_bin$temp_mean[max_idx_bin], "°C, RR=", 
+            round(no_icu_bin$relative_risk[max_idx_bin], 2), "\n")
+      }
+    }
+    
+    # Consistency assessment
+    cat("\nResults consistency assessment:\n")
+    cat("✓ If both models' main conclusions are similar, results are robust\n")
+    cat("✓ If continuous model AIC is lower, continuous relationship better fits data\n")
+    cat("✓ If binned model is easier to interpret, can be used for policy making\n")
+    cat("✓ Recommend reporting results from both methods in papers\n")
+  }
+  
+  cat("\n=== Model Comparison Completed ===\n")
+}
+
+##############################################################
+# Supplement: Model diagnostic function
+##############################################################
+diagnose_continuous_icu_model <- function(results) {
+  
+  cat("=== Continuous ICU Interaction Model Diagnostics ===\n")
+  
+  model <- results$model
+  
+  # 1. Coefficient significance check
+  cat("\n1. Coefficient Significance Check:\n")
+  coef_summary <- summary(model)$coefficients
+  icu_coefs <- coef_summary[grepl("temp_centered.*icu", rownames(coef_summary)), ]
+  
+  cat("ICU interaction term significance:\n")
+  for(i in 1:nrow(icu_coefs)) {
+    coef_name <- rownames(icu_coefs)[i]
+    p_val <- icu_coefs[i, "Pr(>|z|)"]
+    significance <- ifelse(p_val < 0.001, "***", 
+                          ifelse(p_val < 0.01, "**", 
+                                ifelse(p_val < 0.05, "*", "")))
+    cat("  ", coef_name, ": p =", format(p_val, digits = 4), significance, "\n")
+  }
+  
+  # 2. Model fit diagnostics
+  cat("\n2. Model Fit Diagnostics:\n")
+  cat("AIC:", format(results$model_aic, scientific = FALSE), "\n")
+  cat("Log-likelihood:", format(as.numeric(logLik(model)), scientific = FALSE), "\n")
+  cat("Number of observations:", nobs(model), "\n")
+  cat("Number of coefficients:", length(coef(model)), "\n")
+  
+  # 3. Prediction range check
+  cat("\n3. Prediction Range Check:\n")
+  pred_range <- range(results$predictions$relative_risk, na.rm = TRUE)
+  cat("Relative risk ratio range:", round(pred_range, 2), "\n")
+  
+  if(pred_range[2] > 50) {
+    cat("⚠️  Warning: Maximum risk ratio too high, potential extrapolation issues\n")
+  }
+  if(pred_range[1] < 0.01) {
+    cat("⚠️  Warning: Minimum risk ratio too low, potential extrapolation issues\n")
+  }
+  
+  # 4. Confidence interval check
+  cat("\n4. Confidence Interval Check:\n")
+  ci_width <- results$predictions$ci_upper - results$predictions$ci_lower
+  avg_ci_width <- mean(ci_width, na.rm = TRUE)
+  cat("Average confidence interval width:", round(avg_ci_width, 2), "\n")
+  
+  if(avg_ci_width > 5) {
+    cat("⚠️  Warning: Confidence intervals relatively wide, estimation uncertainty high\n")
+  }
+  
+  # 5. Turning point reasonableness check
+  cat("\n5. Turning Point Reasonableness Check:\n")
+  temp_range <- results$filtered_temp_range
+  
+  no_icu_data <- results$predictions[results$predictions$ICU_status == "No_ICU", ]
+  has_icu_data <- results$predictions[results$predictions$ICU_status == "Has_ICU", ]
+  
+  turning_point_no_icu <- unique(no_icu_data$turning_point)[1]
+  turning_point_has_icu <- unique(has_icu_data$turning_point)[1]
+  
+  if(!is.na(turning_point_no_icu)) {
+    if(turning_point_no_icu < temp_range[1] || turning_point_no_icu > temp_range[2]) {
+      cat("⚠️  Warning: No ICU group turning point(", round(turning_point_no_icu, 1), "°C) outside data range\n")
+    } else {
+      cat("✓ No ICU group turning point reasonable:", round(turning_point_no_icu, 1), "°C\n")
+    }
+  }
+  
+  if(!is.na(turning_point_has_icu)) {
+    if(turning_point_has_icu < temp_range[1] || turning_point_has_icu > temp_range[2]) {
+      cat("⚠️  Warning: Has ICU group turning point(", round(turning_point_has_icu, 1), "°C) outside data range\n")
+    } else {
+      cat("✓ Has ICU group turning point reasonable:", round(turning_point_has_icu, 1), "°C\n")
+    }
+  }
+  
+  # 6. Data filtering effect assessment
+  cat("\n6. Data Filtering Effect Assessment:\n")
+  filter_pct <- (nrow(results$data_original) - nrow(results$data_filtered)) / 
+                nrow(results$data_original) * 100
+  cat("Filtered data percentage:", round(filter_pct, 1), "%\n")
+  
+  if(filter_pct > 5) {
+    cat("⚠️  Note: High percentage of data filtered, may affect result representativeness\n")
+  } else {
+    cat("✓ Data filtering percentage reasonable\n")
+  }
+  
+  # Overall assessment
+  cat("\n=== Overall Model Quality Assessment ===\n")
+  
+  issues <- 0
+  if(results$significant_icu_coefs < 2) {
+    cat("⚠️  ICU interaction effects may not be significant\n")
+    issues <- issues + 1
+  }
+  if(pred_range[2] > 50 || pred_range[1] < 0.01) {
+    cat("⚠️  Prediction range may have issues\n")
+    issues <- issues + 1
+  }
+  if(avg_ci_width > 5) {
+    cat("⚠️  Estimation uncertainty relatively high\n")
+    issues <- issues + 1
+  }
+  
+  if(issues == 0) {
+    cat("✅ Model quality good, results highly reliable\n")
+  } else if(issues <= 2) {
+    cat("⚠️  Model basically usable, but note the above issues\n")
+  } else {
+    cat("❌ Model may have significant problems, recommend checking data or adjusting model\n")
+  }
+  
+  cat("\n=== Model Diagnostics Completed ===\n")
+}
+
+cat("\n=== Continuous Quadratic ICU Interaction Effect Analysis Code Complete Version V4.0 Ready ===\n")
+cat("✅ Complete function list:\n")
+cat("1. Data filtering and preprocessing (filter_extreme_temperatures)\n")
+cat("2. ICU interaction quadratic model estimation (estimate_quadratic_icu_interaction_model)\n")
+cat("3. Marginal effects calculation (calculate_icu_interaction_marginal_effects)\n")
+cat("4. Stratified interaction effects plot (plot_icu_interaction_with_distribution)\n")
+cat("5. Representative temperature points forest plot (create_continuous_icu_forest_plot)\n")
+cat("6. ICU protection effect analysis (calculate_continuous_icu_protection)\n")
+cat("7. One-click complete analysis (run_continuous_icu_interaction_analysis)\n")
+cat("8. Data requirements check (check_icu_data_requirements)\n")
+cat("9. Automatic results interpretation (interpret_continuous_icu_results)\n")
+cat("10. Model comparison function (compare_continuous_vs_binned_results)\n")
+cat("11. Model diagnostic function (diagnose_continuous_icu_model)\n\n")
+
+cat("🔬 Usage recommendations:\n")
+cat("- First run: check_icu_data_requirements(data_clean)\n")
+cat("- Core analysis: run_continuous_icu_interaction_analysis(...)\n")
+cat("- Results interpretation: interpret_continuous_icu_results(...)\n")
+cat("- Model diagnostics: diagnose_continuous_icu_model(...)\n")
+cat("- Model comparison: compare_continuous_vs_binned_results(...)\n\n")
+
+cat("📈 Output description:\n")
+cat("- Continuous smooth temperature-risk relationship curves\n")
+cat("- Precise ICU group-specific turning point calculations\n")
+cat("- Quantified ICU protection effects\n")
+cat("- High-quality academic plots (300dpi PNG)\n")
+cat("- Detailed statistical test results\n")
+cat("- Comparative analysis with binned models\n\n")
+
+cat("=== Code is now complete and ready for analysis ===\n")

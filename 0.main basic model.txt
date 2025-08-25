@@ -1,0 +1,772 @@
+# Chikungunya Fever Poisson Panel Fixed Effects Model Analysis - Complete Version with Land Use Variables (Including Model5)
+# Chikungunya Poisson Panel Fixed Effects Analysis - Complete Version with Land Use
+
+# Load necessary packages
+library(fixest)        # Fixed effects models
+library(data.table)    # Data processing
+library(readr)         # Read CSV files
+library(writexl)       # Export Excel
+library(broom)         # Model tidying
+library(dplyr)         # Data manipulation
+library(ggplot2)       # Plotting
+library(openxlsx)      # Advanced Excel operations
+
+# Set working directory and data path
+data_path <- "C:/Users/a1230/Desktop/基孔肯雅热/chikungunya_weather_population_merged.csv"
+
+# Read data
+cat("Reading data...\n")
+data <- fread(data_path, encoding = "UTF-8")
+
+# Check data structure
+cat("Data dimensions:", dim(data), "\n")
+cat("Column names:\n")
+print(names(data))
+cat("\nFirst few rows:\n")
+print(head(data))
+
+# Data preprocessing
+cat("\n======= Data Preprocessing =======\n")
+
+# Convert data types
+data[, cityid := as.factor(cityid)]
+data[, year := as.integer(year)]
+data[, month := as.integer(month)]
+
+# Create time identifier
+data[, year_month := paste0(year, "_", sprintf("%02d", month))]
+data[, year_month := as.factor(year_month)]
+
+# Rename dependent variable to more intuitive name
+setnames(data, "Y", "cases")
+
+# Check dependent variable
+cat("Dependent variable (cases) statistics:\n")
+print(summary(data$cases))
+cat("Number of observations with cases = 0:", sum(data$cases == 0, na.rm = TRUE), "\n")
+cat("Number of observations with cases > 0:", sum(data$cases > 0, na.rm = TRUE), "\n")
+
+# Process population data as exposure
+if("total_population" %in% names(data)) {
+  data[, total_population := as.numeric(total_population)]
+  # Handle zero or negative population values
+  data[total_population <= 0 | is.na(total_population), total_population := 1]
+  data[, log_population := log(total_population)]
+  cat("Created log population variable as exposure\n")
+  population_available <- TRUE
+} else {
+  cat("Warning: Population data column not found\n")
+  population_available <- FALSE
+}
+
+# Process population density
+if("mean_population_density" %in% names(data)) {
+  data[, mean_population_density := as.numeric(mean_population_density)]
+  data[, log_pop_density := log(mean_population_density + 1)]
+  cat("Created log population density variable\n")
+  pop_density_available <- TRUE
+} else {
+  cat("Warning: Population density data not found\n")
+  pop_density_available <- FALSE
+}
+
+# Process land use variables
+land_use_vars <- c('forest', 'farming', 'urban')
+land_use_available <- c()
+
+for(var in land_use_vars) {
+  if(var %in% names(data)) {
+    data[, (var) := as.numeric(get(var))]
+    # Handle missing values or outliers
+    data[is.na(get(var)) | get(var) < 0, (var) := 0]
+    land_use_available <- c(land_use_available, var)
+    cat(sprintf("Processed %s variable\n", var))
+    cat(sprintf("%s statistics:\n", var))
+    print(summary(data[[var]]))
+  } else {
+    cat(sprintf("Warning: %s variable not found\n", var))
+  }
+}
+
+cat(sprintf("Available land use variables: %s\n", paste(land_use_available, collapse = ", ")))
+
+# Process ICU variable (continuous, also create binary classification)
+if("ICU" %in% names(data)) {
+  data[, ICU := as.numeric(ICU)]
+  # Handle missing values or outliers
+  data[is.na(ICU) | ICU < 0, ICU := 0]
+  
+  # Create ICU binary variable (for Model 4 interaction effects and Model 5 main effects)
+  data[, ICU_binary := ifelse(ICU > 0, "Has_ICU", "No_ICU")]
+  data[, ICU_binary := factor(ICU_binary, levels = c("No_ICU", "Has_ICU"))]
+  
+  # Display ICU statistics
+  cat("ICU continuous statistics:\n")
+  print(summary(data$ICU))
+  cat("ICU binary statistics:\n")
+  print(table(data$ICU_binary))
+  
+  cat("Processed ICU variable (continuous and binary)\n")
+  ICU_available <- TRUE
+} else {
+  cat("Warning: ICU variable not found\n")
+  ICU_available <- FALSE
+}
+
+# Process hospital variable
+if("hospital" %in% names(data)) {
+  data[, hospital := as.numeric(hospital)]
+  # Handle missing values or outliers
+  data[is.na(hospital) | hospital < 0, hospital := 0]
+  cat("Processed hospital variable\n")
+  cat("Hospital statistics:\n")
+  print(summary(data$hospital))
+  hospital_available <- TRUE
+} else {
+  cat("Warning: Hospital variable not found\n")
+  hospital_available <- FALSE
+}
+
+# Create temperature-related variables
+data[, temp_range := temp_max_mean - temp_min_mean]  # Temperature range
+data[, temperature_sq := temperature_mean^2]         # Temperature squared
+
+# Create temperature × ICU binary interaction terms (only for Model 4 preparation)
+if(ICU_available) {
+  data[, temp_no_icu := ifelse(ICU_binary == "No_ICU", temperature_mean, 0)]
+  data[, temp_has_icu := ifelse(ICU_binary == "Has_ICU", temperature_mean, 0)]
+  data[, temp_sq_no_icu := ifelse(ICU_binary == "No_ICU", temperature_sq, 0)]
+  data[, temp_sq_has_icu := ifelse(ICU_binary == "Has_ICU", temperature_sq, 0)]
+  cat("Created temperature × ICU binary interaction terms (for Model 4)\n")
+}
+
+# Check missing values
+cat("\nMissing values check:\n")
+missing_vars <- sapply(data, function(x) sum(is.na(x)))
+print(missing_vars[missing_vars > 0])
+
+# Remove observations with too many missing values
+required_vars <- c("cases", "cityid", "year", "month", 
+                   "humidity_mean", "pressure_mean", 
+                   "temperature_mean", "wind_speed_mean")
+
+# If ICU and hospital variables are available, require these variables to be complete
+if(ICU_available) required_vars <- c(required_vars, "ICU")
+if(hospital_available) required_vars <- c(required_vars, "hospital")
+
+# Add available land use variables to required variables list
+required_vars <- c(required_vars, land_use_available)
+
+complete_cases <- complete.cases(data[, ..required_vars])
+data_clean <- data[complete_cases]
+cat("Data dimensions after cleaning:", dim(data_clean), "\n")
+
+##############################################################
+# Descriptive statistics
+##############################################################
+cat("\n======= Descriptive Statistics =======\n")
+
+# Descriptive statistics for main variables
+main_vars <- c("cases", "humidity_mean", "pressure_mean", "rainfall_sum", 
+               "temp_max_mean", "temp_min_mean", "temperature_mean", 
+               "wind_speed_mean", "total_population", "mean_population_density")
+
+# Add ICU and hospital variables to descriptive statistics
+if(ICU_available) main_vars <- c(main_vars, "ICU")
+if(hospital_available) main_vars <- c(main_vars, "hospital")
+
+# Add land use variables to descriptive statistics
+main_vars <- c(main_vars, land_use_available)
+
+existing_vars <- main_vars[main_vars %in% names(data_clean)]
+desc_stats <- data_clean[, lapply(.SD, function(x) {
+  c(Mean = mean(x, na.rm = TRUE),
+    Median = median(x, na.rm = TRUE),
+    SD = sd(x, na.rm = TRUE),
+    Min = min(x, na.rm = TRUE),
+    Max = max(x, na.rm = TRUE))
+}), .SDcols = existing_vars]
+
+print(desc_stats)
+
+##############################################################
+# Model 1: Basic weather variables + rainfall
+##############################################################
+cat("\n======= Model 1: Basic Weather Variables + Rainfall =======\n")
+
+weather_vars <- c("humidity_mean", "pressure_mean", "temperature_mean", 
+                  "wind_speed_mean", "temp_range", "temperature_sq")
+
+# Check which weather variables exist
+available_weather <- weather_vars[weather_vars %in% names(data_clean)]
+
+# Add rainfall
+model1_vars <- available_weather
+if("rainfall_sum" %in% names(data_clean)) {
+  model1_vars <- c(model1_vars, "rainfall_sum")
+  rainfall_available <- TRUE
+} else {
+  rainfall_available <- FALSE
+  cat("Warning: Rainfall variable not available\n")
+}
+
+cat("Model 1 variables:", paste(model1_vars, collapse = ", "), "\n")
+
+# Construct model formula
+if(population_available) {
+  model1_formula <- as.formula(paste("cases ~", paste(model1_vars, collapse = " + "), 
+                                     "| cityid + year_month"))
+  model1 <- fepois(model1_formula, offset = ~log_population, data = data_clean)
+} else {
+  model1_formula <- as.formula(paste("cases ~", paste(model1_vars, collapse = " + "), 
+                                     "| cityid + year_month"))
+  model1 <- fepois(model1_formula, data = data_clean)
+}
+
+cat("Model 1 results:\n")
+print(summary(model1))
+
+##############################################################
+# Model 2: Add socioeconomic variables and land use variables
+##############################################################
+cat("\n======= Model 2: Add Socioeconomic Variables and Land Use Variables =======\n")
+
+model2_vars <- model1_vars
+
+# Add population density
+if(pop_density_available) {
+  model2_vars <- c(model2_vars, "log_pop_density")
+}
+
+# Add land use variables
+model2_vars <- c(model2_vars, land_use_available)
+
+cat("Model 2 variables:", paste(model2_vars, collapse = ", "), "\n")
+
+if(population_available) {
+  model2_formula <- as.formula(paste("cases ~", paste(model2_vars, collapse = " + "), 
+                                     "| cityid + year_month"))
+  model2 <- fepois(model2_formula, offset = ~log_population, data = data_clean)
+} else {
+  model2_formula <- as.formula(paste("cases ~", paste(model2_vars, collapse = " + "), 
+                                     "| cityid + year_month"))
+  model2 <- fepois(model2_formula, data = data_clean)
+}
+
+cat("Model 2 results:\n")
+print(summary(model2))
+model2_available <- TRUE
+
+##############################################################
+# Model 3: Add medical resource variables (ICU continuous)
+##############################################################
+cat("\n======= Model 3: Add Medical Resource Variables (Hospital + ICU Continuous) =======\n")
+
+# Start from Model 2
+model3_vars <- model2_vars
+added_vars <- c()
+
+if(hospital_available) {
+  model3_vars <- c(model3_vars, "hospital")
+  added_vars <- c(added_vars, "hospital")
+}
+
+if(ICU_available) {
+  model3_vars <- c(model3_vars, "ICU")
+  added_vars <- c(added_vars, "ICU")
+}
+
+cat("Model 3 added variables to Model 2:", paste(added_vars, collapse = ", "), "\n")
+cat("Model 3 all variables:", paste(model3_vars, collapse = ", "), "\n")
+
+if(length(added_vars) > 0) {
+  if(population_available) {
+    model3_formula <- as.formula(paste("cases ~", paste(model3_vars, collapse = " + "), 
+                                       "| cityid + year_month"))
+    model3 <- fepois(model3_formula, offset = ~log_population, data = data_clean)
+  } else {
+    model3_formula <- as.formula(paste("cases ~", paste(model3_vars, collapse = " + "), 
+                                       "| cityid + year_month"))
+    model3 <- fepois(model3_formula, data = data_clean)
+  }
+  
+  cat("Model 3 results:\n")
+  print(summary(model3))
+  model3_available <- TRUE
+} else {
+  cat("Medical resource variables not available, skipping Model 3\n")
+  model3 <- NULL
+  model3_available <- FALSE
+}
+
+##############################################################
+# Model 4: ICU binary interaction effects
+##############################################################
+cat("\n======= Model 4: ICU Binary Interaction Effects =======\n")
+
+# Determine base variable set
+if(model3_available) {
+  base_vars <- model3_vars
+  base_model_name <- "Model 3"
+} else if(model2_available) {
+  base_vars <- model2_vars
+  base_model_name <- "Model 2"
+} else {
+  base_vars <- model1_vars
+  base_model_name <- "Model 1"
+}
+
+# Check ICU variable availability
+if(ICU_available) {
+  # Remove ICU continuous variable and original temperature terms from base variables
+  base_vars_no_temp_icu <- base_vars[!base_vars %in% c("temperature_mean", "temperature_sq", "ICU")]
+  
+  # Add grouped temperature interaction terms and ICU binary main effect
+  model4_vars <- c(base_vars_no_temp_icu, "ICU_binary", 
+                   "temp_no_icu", "temp_has_icu", 
+                   "temp_sq_no_icu", "temp_sq_has_icu")
+  
+  cat("Model 4 variables:", paste(model4_vars, collapse = ", "), "\n")
+  
+  if(population_available) {
+    model4_formula <- as.formula(paste("cases ~", paste(model4_vars, collapse = " + "), 
+                                       "| cityid + year_month"))
+    model4 <- fepois(model4_formula, offset = ~log_population, data = data_clean)
+  } else {
+    model4_formula <- as.formula(paste("cases ~", paste(model4_vars, collapse = " + "), 
+                                       "| cityid + year_month"))
+    model4 <- fepois(model4_formula, data = data_clean)
+  }
+  
+  cat("Model 4 results (ICU binary interaction effects):\n")
+  print(summary(model4))
+  model4_available <- TRUE
+  
+  cat(sprintf("Model 4 replaced ICU continuous variable with ICU binary interaction effects based on %s\n", base_model_name))
+} else {
+  cat("ICU variable not available, skipping Model 4\n")
+  model4 <- NULL
+  model4_available <- FALSE
+}
+
+##############################################################
+# Model 5: ICU binary main effects (newly added)
+##############################################################
+cat("\n======= Model 5: ICU Binary Main Effects (Newly Added) =======\n")
+
+# Same structure as Model 3, but ICU uses binary classification
+model5_vars <- model2_vars
+added_vars_model5 <- c()
+
+if(hospital_available) {
+  model5_vars <- c(model5_vars, "hospital")
+  added_vars_model5 <- c(added_vars_model5, "hospital")
+}
+
+if(ICU_available) {
+  model5_vars <- c(model5_vars, "ICU_binary")  # Use binary ICU
+  added_vars_model5 <- c(added_vars_model5, "ICU_binary")
+}
+
+cat("Model 5 added variables to Model 2:", paste(added_vars_model5, collapse = ", "), "\n")
+cat("Model 5 all variables:", paste(model5_vars, collapse = ", "), "\n")
+
+if(length(added_vars_model5) > 0) {
+  if(population_available) {
+    model5_formula <- as.formula(paste("cases ~", paste(model5_vars, collapse = " + "), 
+                                       "| cityid + year_month"))
+    model5 <- fepois(model5_formula, offset = ~log_population, data = data_clean)
+  } else {
+    model5_formula <- as.formula(paste("cases ~", paste(model5_vars, collapse = " + "), 
+                                       "| cityid + year_month"))
+    model5 <- fepois(model5_formula, data = data_clean)
+  }
+  
+  cat("Model 5 results (ICU binary main effects):\n")
+  print(summary(model5))
+  model5_available <- TRUE
+  
+  cat("Difference between Model 5 and Model 3: ICU variable changed from continuous to binary\n")
+} else {
+  cat("Medical resource variables not available, skipping Model 5\n")
+  model5 <- NULL
+  model5_available <- FALSE
+}
+
+##############################################################
+# Model comparison
+##############################################################
+cat("\n======= Model Comparison =======\n")
+
+# Collect available models
+models_list <- list()
+if(exists("model1") && !is.null(model1)) models_list$Model1 = model1
+if(model2_available) models_list$Model2 = model2
+if(model3_available) models_list$Model3 = model3
+if(model4_available) models_list$Model4 = model4
+if(model5_available) models_list$Model5 = model5
+
+# Create comparison table
+if(length(models_list) > 1) {
+  comparison <- etable(models_list, 
+                       title = "Chikungunya Fever Poisson Fixed Effects Model Comparison (with Land Use Variables + Model5)",
+                       digits = 4,
+                       se.below = TRUE)
+  print(comparison)
+} else {
+  cat("Only one model available\n")
+}
+
+##############################################################
+# Simple academic format table export (single sheet only)
+##############################################################
+
+create_simple_academic_table <- function(models_list, filename = "chikungunya_models_table.xlsx") {
+  
+  # Create workbook
+  wb <- createWorkbook()
+  addWorksheet(wb, "Model Comparison")
+  
+  # Get model information
+  model_names <- names(models_list)
+  n_models <- length(models_list)
+  
+  # Define styles
+  header_style <- createStyle(
+    fontSize = 11,
+    fontName = "Times New Roman",
+    halign = "center",
+    valign = "center",
+    textDecoration = "bold"
+  )
+  
+  var_style <- createStyle(
+    fontSize = 11,
+    fontName = "Times New Roman",
+    halign = "left",
+    valign = "center"
+  )
+  
+  coef_style <- createStyle(
+    fontSize = 11,
+    fontName = "Times New Roman",
+    halign = "center",
+    valign = "center"
+  )
+  
+  # Start filling the table
+  current_row <- 1
+  
+  # Header row
+  writeData(wb, sheet = 1, x = "", startCol = 1, startRow = current_row)
+  for(i in 1:n_models) {
+    writeData(wb, sheet = 1, x = model_names[i], startCol = i + 1, startRow = current_row)
+    addStyle(wb, sheet = 1, header_style, rows = current_row, cols = i + 1)
+  }
+  current_row <- current_row + 1
+  
+  # Dependent Variable row
+  writeData(wb, sheet = 1, x = "Dependent Var.", startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  for(i in 1:n_models) {
+    writeData(wb, sheet = 1, x = "cases", startCol = i + 1, startRow = current_row)
+    addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = i + 1)
+  }
+  current_row <- current_row + 2
+  
+  # Get all variables and arrange in specific order
+  var_order <- c("humidity_mean", "pressure_mean", "temperature_mean", "wind_speed_mean", 
+                 "temp_range", "temperature_sq", "rainfall_sum", "log_pop_density", 
+                 "forest", "farming", "urban", "hospital", "ICU", "ICU_binaryHas_ICU", 
+                 "temp_no_icu", "temp_has_icu", "temp_sq_no_icu", "temp_sq_has_icu")
+  
+  # Get actually existing variables
+  all_vars <- unique(unlist(lapply(models_list, function(x) names(coef(x)))))
+  ordered_vars <- var_order[var_order %in% all_vars]
+  remaining_vars <- all_vars[!all_vars %in% var_order]
+  final_vars <- c(ordered_vars, remaining_vars)
+  
+  # Write coefficient section
+  for(var in final_vars) {
+    # Write variable name
+    writeData(wb, sheet = 1, x = var, startCol = 1, startRow = current_row)
+    addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+    
+    # Write coefficients for each model
+    for(j in 1:n_models) {
+      model <- models_list[[j]]
+      coefs <- coef(model)
+      
+      if(var %in% names(coefs)) {
+        se_vals <- se(model)
+        coef_val <- coefs[var]
+        se_val <- se_vals[var]
+        
+        # Calculate t-statistic and p-value
+        t_stat <- coef_val / se_val
+        p_val <- 2 * (1 - pnorm(abs(t_stat)))
+        
+        # Significance marks
+        sig_mark <- ifelse(p_val < 0.001, "***",
+                           ifelse(p_val < 0.01, "**",
+                                  ifelse(p_val < 0.05, "*",
+                                         ifelse(p_val < 0.1, ".", ""))))
+        
+        # Format coefficient
+        coef_text <- sprintf("%.4f%s", coef_val, sig_mark)
+        
+        writeData(wb, sheet = 1, x = coef_text, startCol = j + 1, startRow = current_row)
+        addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = j + 1)
+      }
+    }
+    current_row <- current_row + 1
+    
+    # Write standard error row
+    for(j in 1:n_models) {
+      model <- models_list[[j]]
+      coefs <- coef(model)
+      
+      if(var %in% names(coefs)) {
+        se_vals <- se(model)
+        se_val <- se_vals[var]
+        se_text <- sprintf("(%.4f)", se_val)
+        
+        writeData(wb, sheet = 1, x = se_text, startCol = j + 1, startRow = current_row)
+        addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = j + 1)
+      }
+    }
+    current_row <- current_row + 1
+  }
+  
+  # Empty row
+  current_row <- current_row + 1
+  
+  # Fixed effects
+  writeData(wb, sheet = 1, x = "Fixed-Effects:", startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  current_row <- current_row + 1
+  
+  writeData(wb, sheet = 1, x = "cityid", startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  for(j in 1:n_models) {
+    writeData(wb, sheet = 1, x = "Yes", startCol = j + 1, startRow = current_row)
+    addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = j + 1)
+  }
+  current_row <- current_row + 1
+  
+  writeData(wb, sheet = 1, x = "year_month", startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  for(j in 1:n_models) {
+    writeData(wb, sheet = 1, x = "Yes", startCol = j + 1, startRow = current_row)
+    addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = j + 1)
+  }
+  current_row <- current_row + 2
+  
+  # Model statistics
+  writeData(wb, sheet = 1, x = "S.E.: Clustered", startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  for(j in 1:n_models) {
+    writeData(wb, sheet = 1, x = "by: cityid", startCol = j + 1, startRow = current_row)
+    addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = j + 1)
+  }
+  current_row <- current_row + 1
+  
+  writeData(wb, sheet = 1, x = "Observations", startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  for(j in 1:n_models) {
+    obs_val <- format(nobs(models_list[[j]]), big.mark = ",")
+    writeData(wb, sheet = 1, x = obs_val, startCol = j + 1, startRow = current_row)
+    addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = j + 1)
+  }
+  current_row <- current_row + 1
+  
+  writeData(wb, sheet = 1, x = "Pseudo R2", startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  for(j in 1:n_models) {
+    r2_val <- sprintf("%.5f", models_list[[j]]$pseudo_r2)
+    writeData(wb, sheet = 1, x = r2_val, startCol = j + 1, startRow = current_row)
+    addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = j + 1)
+  }
+  current_row <- current_row + 1
+  
+  writeData(wb, sheet = 1, x = "BIC", startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  for(j in 1:n_models) {
+    bic_val <- format(round(BIC(models_list[[j]]), 1), big.mark = ",")
+    writeData(wb, sheet = 1, x = bic_val, startCol = j + 1, startRow = current_row)
+    addStyle(wb, sheet = 1, coef_style, rows = current_row, cols = j + 1)
+  }
+  current_row <- current_row + 2
+  
+  # Significance notes
+  writeData(wb, sheet = 1, x = "Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1", 
+            startCol = 1, startRow = current_row)
+  addStyle(wb, sheet = 1, var_style, rows = current_row, cols = 1)
+  
+  # Set column widths
+  setColWidths(wb, sheet = 1, cols = 1, widths = 18)
+  setColWidths(wb, sheet = 1, cols = 2:(n_models + 1), widths = 12)
+  
+  # Save file
+  saveWorkbook(wb, filename, overwrite = TRUE)
+  cat("Saved academic format table to:", filename, "\n")
+  
+  return(wb)
+}
+
+# Set output folder
+output_folder <- "C:/Users/a1230/Desktop/file"
+
+# Ensure folder exists
+if(!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+  cat("Created output folder:", output_folder, "\n")
+}
+
+# Export simple table to specified folder
+if(exists("models_list") && length(models_list) > 1) {
+  output_file <- file.path(output_folder, "Chikungunya_Model_Comparison_Table_Complete_Version.xlsx")
+  create_simple_academic_table(models_list, output_file)
+  
+  # Verify if file was saved successfully
+  if(file.exists(output_file)) {
+    cat("✓ File saved successfully!\n")
+    cat("File size:", round(file.size(output_file)/1024, 2), "KB\n")
+  } else {
+    cat("✗ File save failed!\n")
+  }
+  
+  cat("\n=== Export Complete ===\n")
+  cat("File path:", output_file, "\n")
+  cat("Format: Standard academic paper format (single table)\n")
+  cat("Models: Total", length(models_list), "models\n")
+  cat("- Model1: Basic weather variables + rainfall\n")
+  cat("- Model2: Model1 + population density + land use variables\n")
+  cat("- Model3: Model2 + hospital + ICU (continuous)\n")
+  cat("- Model4: Model3 base but ICU changed to binary interaction effects\n")
+  cat("- Model5: Model2 + hospital + ICU (binary main effects)\n")
+}
+
+##############################################################
+# Model comparison analysis (focus on Model3 vs Model5)
+##############################################################
+cat("\n======= Model3 vs Model5 Comparison Analysis =======\n")
+
+if(model3_available && model5_available) {
+  cat("Key differences between Model3 vs Model5:\n")
+  cat("- Model3: Uses ICU continuous variable\n")
+  cat("- Model5: Uses ICU binary variable\n")
+  cat("- All other variables are identical (including land use variables)\n\n")
+  
+  # Extract ICU effects
+  model3_coef <- coef(model3)
+  model5_coef <- coef(model5)
+  
+  if("ICU" %in% names(model3_coef)) {
+    icu_continuous_effect <- model3_coef["ICU"]
+    icu_continuous_irr <- exp(icu_continuous_effect)
+    cat(sprintf("Model3 - ICU continuous effect: coefficient=%.6f, IRR=%.4f\n", 
+                icu_continuous_effect, icu_continuous_irr))
+  }
+  
+  if("ICU_binaryHas_ICU" %in% names(model5_coef)) {
+    icu_binary_effect <- model5_coef["ICU_binaryHas_ICU"]
+    icu_binary_irr <- exp(icu_binary_effect)
+    cat(sprintf("Model5 - ICU binary effect: coefficient=%.6f, IRR=%.4f\n", 
+                icu_binary_effect, icu_binary_irr))
+  }
+  
+  # Model selection criteria comparison
+  aic3 <- AIC(model3)
+  aic5 <- AIC(model5)
+  bic3 <- BIC(model3)
+  bic5 <- BIC(model5)
+  
+  cat(sprintf("\nModel comparison:\n"))
+  cat(sprintf("- Model3 AIC: %.0f, BIC: %.0f\n", aic3, bic3))
+  cat(sprintf("- Model5 AIC: %.0f, BIC: %.0f\n", aic5, bic5))
+  cat(sprintf("- AIC difference: %.0f (Model5 is %s than Model3)\n", 
+              aic5 - aic3, ifelse(aic5 < aic3, "better", "worse")))
+  cat(sprintf("- BIC difference: %.0f (Model5 is %s than Model3)\n", 
+              bic5 - bic3, ifelse(bic5 < bic3, "better", "worse")))
+}
+
+##############################################################
+# Land use variables effect analysis
+##############################################################
+if(length(land_use_available) > 0) {
+  cat("\n======= Land Use Variables Effect Analysis =======\n")
+  
+  # Select best model for land use effect analysis
+  final_model <- models_list[[length(models_list)]]
+  final_coef <- coef(final_model)
+  
+  cat("Land use variables effects (based on final model):\n")
+  for(var in land_use_available) {
+    if(var %in% names(final_coef)) {
+      coef_val <- final_coef[var]
+      irr_val <- exp(coef_val)
+      percent_change <- (irr_val - 1) * 100
+      
+      cat(sprintf("- %s: coefficient=%.6f, IRR=%.4f, percent change=%.2f%%\n", 
+                  var, coef_val, irr_val, percent_change))
+      
+      # Interpretation
+      direction <- ifelse(coef_val > 0, "increases", "decreases")
+      cat(sprintf("  Interpretation: For every 1 percentage point increase in %s proportion, incidence rate %s by %.2f%%\n", 
+                  var, direction, abs(percent_change)))
+    }
+  }
+}
+
+##############################################################
+# Complete analysis summary
+##############################################################
+cat("\n======= Complete Analysis Summary =======\n")
+
+cat("Main findings:\n")
+cat("1. Fitted", length(models_list), "models in total\n")
+cat("2. Added Model5 to implement ICU variable binarization\n")
+cat("3. All models include land use variables\n")
+cat("4. Analyzed", nobs(models_list[[length(models_list)]]), "observations\n")
+
+if(length(land_use_available) > 0) {
+  cat("5. Land use variables:\n")
+  for(var in land_use_available) {
+    var_mean <- mean(data_clean[[var]], na.rm = TRUE)
+    var_sd <- sd(data_clean[[var]], na.rm = TRUE)
+    cat(sprintf("   - %s: mean=%.2f, standard deviation=%.2f\n", var, var_mean, var_sd))
+  }
+}
+
+if(ICU_available) {
+  cat("6. ICU variable processing:\n")
+  cat("   - Model3: ICU continuous (number of beds)\n")
+  cat("   - Model4: ICU binary interaction effects (temperature × ICU)\n")
+  cat("   - Model5: ICU binary main effects (whether has ICU)\n")
+  
+  icu_table <- table(data_clean$ICU_binary)
+  for(level in names(icu_table)) {
+    pct <- round(100 * icu_table[level] / sum(icu_table), 1)
+    cat(sprintf("   - %s: %d observations (%s%%)\n", level, icu_table[level], pct))
+  }
+}
+
+# Select best model
+best_aic <- min(sapply(models_list, AIC))
+best_model_name <- names(models_list)[which.min(sapply(models_list, AIC))]
+cat(sprintf("\n7. Best model: %s (AIC = %.0f)\n", best_model_name, best_aic))
+
+cat("\nPolicy recommendations:\n")
+cat("1. Model5 provides clear policy guidance for ICU resource allocation\n")
+cat("2. Land use planning should consider disease transmission risks\n")
+cat("3. Areas with weak medical resources and high urbanization levels need special attention\n")
+cat("4. Medical resource needs should be reassessed under climate change background\n")
+
+cat("\nFile output:\n")
+cat("- Excel table path: C:/Users/a1230/Desktop/file/Chikungunya_Model_Comparison_Table_Complete_Version.xlsx\n")
+cat("- Contains complete comparison of 5 models\n")
+cat("- Format suitable for direct copying to papers\n")
+cat("- Includes land use variables and ICU binary classification analysis\n")
+
+cat("\n======= Analysis Complete =======\n")

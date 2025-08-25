@@ -1,0 +1,747 @@
+library(fixest)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+
+##############################################################
+# Helper function: Add transparency
+##############################################################
+add.alpha <- function(col, alpha=1) {
+  apply(sapply(col, col2rgb)/255, 2, 
+        function(x) rgb(x[1], x[2], x[3], alpha))
+}
+
+##############################################################
+# New: Data filtering function - Remove extreme data outside 1% and 99% percentiles
+##############################################################
+filter_extreme_temperatures <- function(data) {
+  
+  cat("\n=== Filtering Extreme Temperature Data ===\n")
+  
+  # Calculate 1% and 99% percentiles
+  temp_p1 <- quantile(data$temperature_mean, 0.01, na.rm = TRUE)
+  temp_p99 <- quantile(data$temperature_mean, 0.99, na.rm = TRUE)
+  
+  cat("Original data rows:", nrow(data), "\n")
+  cat("Temperature range:", round(range(data$temperature_mean, na.rm = TRUE), 1), "°C\n")
+  cat("1% percentile:", round(temp_p1, 1), "°C\n")
+  cat("99% percentile:", round(temp_p99, 1), "°C\n")
+  
+  # Filter data: keep data within 1%-99% range
+  data_filtered <- data[data$temperature_mean >= temp_p1 & 
+                        data$temperature_mean <= temp_p99, ]
+  
+  # Remove NA values
+  data_filtered <- data_filtered[!is.na(data_filtered$temperature_mean), ]
+  
+  cat("Filtered data rows:", nrow(data_filtered), "\n")
+  cat("Removed extreme data:", nrow(data) - nrow(data_filtered), "rows\n")
+  cat("Filtered temperature range:", round(range(data_filtered$temperature_mean, na.rm = TRUE), 1), "°C\n")
+  
+  return(data_filtered)
+}
+
+##############################################################
+# 1. Estimate centered quadratic model (detailed results version)
+##############################################################
+
+estimate_temp_quadratic_model_centered <- function(data, reference_temp = 18.0) {
+  
+  cat("\n=== Estimating Temperature Quadratic Model (Reference:", reference_temp, "°C) ===\n")
+  
+  # Create centered temperature variables - key step!
+  data$temperature_centered <- data$temperature_mean - reference_temp
+  data$temperature_centered_sq <- data$temperature_centered^2
+  
+  cat("Temperature centering completed, reference point:", reference_temp, "°C\n")
+  cat("Centered temperature range:", 
+      round(range(data$temperature_centered, na.rm = TRUE), 1), "\n")
+  
+  # Basic control variables
+  control_vars <- c("humidity_mean", "pressure_mean", "wind_speed_mean", 
+                    "temperature_centered", "temperature_centered_sq")
+  
+  # Add all control variables directly (no individual checking)
+  additional_vars <- c("ICU", "hospital", "log_pop_density", "forest", "farming", "urban")
+  control_vars <- c(control_vars, additional_vars)
+  
+  cat("Included control variables:", paste(control_vars, collapse = ", "), "\n")
+  
+  # Build model formula
+  formula_str <- paste("cases ~", paste(control_vars, collapse = " + "), "| cityid + year_month")
+  
+  cat("Quadratic model formula (centered version):\n")
+  cat(formula_str, "\n")
+  
+  # Estimate model
+  if("log_population" %in% names(data)) {
+    model <- fepois(as.formula(formula_str), 
+                    offset = ~log_population, 
+                    data = data)
+  } else {
+    model <- fepois(as.formula(formula_str), 
+                    data = data)
+  }
+  
+  cat("Centered quadratic model estimation completed\n")
+  
+  # ===== Print detailed quadratic model results =====
+  cat("\n=== Centered Quadratic Model Detailed Results ===\n")
+  
+  # Print model summary
+  print(summary(model))
+  
+  # Extract and print temperature-related coefficients
+  cat("\n=== Temperature-Related Coefficient Details ===\n")
+  model_coef <- coef(model)
+  model_se <- se(model)
+  
+  # Find temperature-related coefficients
+  temp_coef_names <- c("temperature_centered", "temperature_centered_sq")
+  temp_coef_names <- temp_coef_names[temp_coef_names %in% names(model_coef)]
+  
+  if(length(temp_coef_names) > 0) {
+    temp_results <- data.frame(
+      Variable = temp_coef_names,
+      Coefficient = round(model_coef[temp_coef_names], 6),  # Higher precision display
+      Std_Error = round(model_se[temp_coef_names], 6),
+      t_value = round(model_coef[temp_coef_names] / model_se[temp_coef_names], 3),
+      p_value = round(2 * (1 - pnorm(abs(model_coef[temp_coef_names] / model_se[temp_coef_names]))), 4),
+      row.names = NULL
+    )
+    print(temp_results)
+    
+    # Calculate turning point (if quadratic coefficient exists)
+    if("temperature_centered_sq" %in% temp_coef_names && "temperature_centered" %in% temp_coef_names) {
+      temp_linear_coef <- model_coef["temperature_centered"]
+      temp_quad_coef <- model_coef["temperature_centered_sq"]
+      
+      if(!is.na(temp_quad_coef) && temp_quad_coef != 0) {
+        turning_point_centered <- -temp_linear_coef / (2 * temp_quad_coef)
+        turning_point_actual <- turning_point_centered + reference_temp
+        
+        cat("\n=== Turning Point Analysis ===\n")
+        cat("Turning point on centered scale:", round(turning_point_centered, 3), "\n")
+        cat("Actual temperature turning point:", round(turning_point_actual, 2), "°C\n")
+        
+        # Determine turning point nature
+        if(temp_quad_coef > 0) {
+          cat("Turning point nature: Minimum point (U-shaped curve)\n")
+        } else {
+          cat("Turning point nature: Maximum point (Inverted U-shaped curve)\n")
+        }
+        
+        # Turning point position relative to reference point
+        if(abs(turning_point_centered) < 0.5) {
+          cat("Turning point position: Close to reference temperature\n")
+        } else if(turning_point_centered > 0) {
+          cat("Turning point position: Above reference temperature by", round(turning_point_centered, 1), "°C\n")
+        } else {
+          cat("Turning point position: Below reference temperature by", round(-turning_point_centered, 1), "°C\n")
+        }
+      } else {
+        cat("\n=== Turning Point Analysis ===\n")
+        cat("No turning point (quadratic coefficient is 0 or near 0)\n")
+      }
+    }
+  }
+  
+  # Print model fit statistics
+  cat("\n=== Model Fit Statistics ===\n")
+  cat("AIC:", round(AIC(model), 2), "\n")
+  cat("BIC:", round(BIC(model), 2), "\n")
+  cat("Log-likelihood:", round(as.numeric(logLik(model)), 2), "\n")
+  cat("Number of observations:", nobs(model), "\n")
+  
+  # Print other control variable coefficients
+  cat("\n=== Main Control Variable Coefficients ===\n")
+  main_controls <- c("humidity_mean", "pressure_mean", "wind_speed_mean")
+  control_coef_names <- names(model_coef)[names(model_coef) %in% main_controls]
+  
+  if(length(control_coef_names) > 0) {
+    control_results <- data.frame(
+      Variable = control_coef_names,
+      Coefficient = round(model_coef[control_coef_names], 4),
+      Std_Error = round(model_se[control_coef_names], 4),
+      t_value = round(model_coef[control_coef_names] / model_se[control_coef_names], 3),
+      row.names = NULL
+    )
+    print(control_results)
+  }
+  
+  # Verification at reference point
+  cat("\n=== Reference Point Verification ===\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("At reference point (T-T_ref=0):\n")
+  cat("  Linear term contribution: 0 * β1 = 0\n")
+  cat("  Quadratic term contribution: 0² * β2 = 0\n")
+  cat("  Total contribution: 0 (relative risk ratio should be 1.0)\n")
+  
+  cat("\n=== Centered Quadratic Model Results Output Completed ===\n")
+  
+  return(model)
+}
+
+##############################################################
+# 2. Calculate temperature marginal effects (corrected version - from first code)
+##############################################################
+
+calculate_temperature_marginal_effects <- function(model, temp_range, reference_temp = 18.0, n_points = 100) {
+  
+  cat("\n=== Calculating Temperature Marginal Effects (Corrected Version) ===\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  
+  # Get coefficients
+  coef_est <- coef(model)
+  vcov_matrix <- vcov(model)
+  
+  # Check if coefficients exist
+  if(!"temperature_centered" %in% names(coef_est)) {
+    stop("temperature_centered coefficient not found in model")
+  }
+  if(!"temperature_centered_sq" %in% names(coef_est)) {
+    stop("temperature_centered_sq coefficient not found in model")
+  }
+  
+  temp_linear_coef <- coef_est["temperature_centered"]
+  temp_quad_coef <- coef_est["temperature_centered_sq"]
+  
+  cat("Centered temperature linear coefficient (β1):", temp_linear_coef, "\n")
+  cat("Centered temperature quadratic coefficient (β2):", temp_quad_coef, "\n")
+  
+  # Create temperature sequence
+  temp_seq <- seq(temp_range[1], temp_range[2], length.out = n_points)
+  temp_seq_centered <- temp_seq - reference_temp  # Centering
+  
+  # Key correction: Only calculate temperature term contributions (relative to reference temperature)
+  # At reference temperature, temperature term contribution is 0, so RR=1
+  # f(T) - f(T_ref) = β1*(T-T_ref) + β2*(T-T_ref)² - [β1*0 + β2*0²]
+  #                 = β1*(T-T_ref) + β2*(T-T_ref)²
+  
+  marginal_effect <- temp_linear_coef * temp_seq_centered + temp_quad_coef * temp_seq_centered^2
+  relative_risk <- exp(marginal_effect)  # RR relative to reference temperature
+  
+  # Verification: should be 1 at reference temperature
+  ref_idx <- which.min(abs(temp_seq - reference_temp))
+  cat("Marginal effect at reference temperature:", round(marginal_effect[ref_idx], 6), "\n")
+  cat("RR at reference temperature:", round(relative_risk[ref_idx], 6), "(should = 1.0)\n")
+  
+  # Calculate confidence intervals (using centered variable variance)
+  temp_var <- vcov_matrix["temperature_centered", "temperature_centered"]
+  temp_sq_var <- vcov_matrix["temperature_centered_sq", "temperature_centered_sq"]
+  temp_covar <- vcov_matrix["temperature_centered", "temperature_centered_sq"]
+  
+  # Variance calculation: Var(β1*T_c + β2*T_c²) = T_c²*Var(β1) + T_c⁴*Var(β2) + 2*T_c³*Cov(β1,β2)
+  pred_var <- temp_seq_centered^2 * temp_var + 
+    temp_seq_centered^4 * temp_sq_var + 
+    2 * temp_seq_centered^3 * temp_covar
+  
+  pred_se <- sqrt(pred_var)
+  
+  ci_lower <- exp(marginal_effect - 1.96 * pred_se)
+  ci_upper <- exp(marginal_effect + 1.96 * pred_se)
+  
+  # Calculate turning point
+  if(!is.na(temp_quad_coef) && temp_quad_coef != 0) {
+    turning_point_centered <- -temp_linear_coef / (2 * temp_quad_coef)
+    turning_point_actual <- turning_point_centered + reference_temp
+    cat("Turning point temperature:", round(turning_point_actual, 2), "°C\n")
+  } else {
+    turning_point_actual <- NA
+  }
+  
+  results <- data.frame(
+    temperature = temp_seq,
+    temperature_centered = temp_seq_centered,
+    marginal_effect = marginal_effect,
+    relative_risk = relative_risk,
+    prediction_se = pred_se,
+    ci_lower = ci_lower,
+    ci_upper = ci_upper,
+    turning_point = turning_point_actual,
+    reference_temp = reference_temp
+  )
+  
+  return(results)
+}
+
+##############################################################
+# 3A. Calculate absolute risk (exposure-response curve)
+##############################################################
+
+calculate_absolute_risk <- function(model, temp_range, data, reference_temp = 18.0, n_points = 100) {
+  
+  cat("\n=== Calculating Absolute Risk (Exposure-Response Curve) ===\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  
+  # Get coefficients
+  coef_est <- coef(model)
+  
+  # Check if temperature coefficients exist
+  if(!"temperature_centered" %in% names(coef_est)) {
+    stop("temperature_centered coefficient not found in model")
+  }
+  if(!"temperature_centered_sq" %in% names(coef_est)) {
+    stop("temperature_centered_sq coefficient not found in model")
+  }
+  
+  temp_linear_coef <- coef_est["temperature_centered"]
+  temp_quad_coef <- coef_est["temperature_centered_sq"]
+  
+  cat("Centered temperature linear coefficient (β1):", temp_linear_coef, "\n")
+  cat("Centered temperature quadratic coefficient (β2):", temp_quad_coef, "\n")
+  
+  # Create temperature sequence
+  temp_seq <- seq(temp_range[1], temp_range[2], length.out = n_points)
+  temp_seq_centered <- temp_seq - reference_temp  # Centering
+  
+  # Set "standard scenario": fix all control variables at sample means
+  cat("\n=== Setting Standard Scenario (Control Variables Fixed at Means) ===\n")
+  
+  # Create a standard observation with all control variables at their means
+  standard_scenario <- data.frame(
+    temperature_centered = temp_seq_centered,
+    temperature_centered_sq = temp_seq_centered^2
+  )
+  
+  # Add means of other control variables
+  control_vars <- c("humidity_mean", "pressure_mean", "wind_speed_mean", 
+                    "ICU", "hospital", "log_pop_density", "forest", "farming", "urban")
+  
+  for(var in control_vars) {
+    if(var %in% names(data) && var %in% names(coef_est)) {
+      mean_val <- mean(data[[var]], na.rm = TRUE)
+      standard_scenario[[var]] <- mean_val
+      cat(sprintf("%s fixed at mean: %.3f\n", var, mean_val))
+    }
+  }
+  
+  # Calculate absolute risk (incidence rate)
+  # Note: This calculates the linear prediction without fixed effects
+  linear_pred <- 0  # Initialize
+  
+  # Add temperature terms
+  linear_pred <- linear_pred + temp_linear_coef * temp_seq_centered + 
+    temp_quad_coef * temp_seq_centered^2
+  
+  # Add other control variable terms
+  for(var in names(standard_scenario)) {
+    if(var %in% names(coef_est) && !grepl("temperature", var)) {
+      linear_pred <- linear_pred + coef_est[var] * standard_scenario[[var]]
+    }
+  }
+  
+  # Calculate absolute incidence rate
+  # Here we assume a baseline incidence rate (can be adjusted based on actual data)
+  # To get meaningful absolute values, we use the observed average incidence rate as baseline
+  if("cases" %in% names(data) && "log_population" %in% names(data)) {
+    # Calculate average incidence rate in sample (per 100,000 person-months)
+    observed_rate <- mean(data$cases / exp(data$log_population) * 100000, na.rm = TRUE)
+    cat("Observed average incidence rate:", round(observed_rate, 2), "cases/100,000 person-months\n")
+    
+    # Use predicted value at reference temperature as baseline, adjust to observed incidence rate level
+    ref_idx <- which.min(abs(temp_seq - reference_temp))
+    baseline_adjustment <- log(observed_rate) - linear_pred[ref_idx]
+    
+    # Adjusted absolute incidence rate
+    absolute_rate <- exp(linear_pred + baseline_adjustment)
+  } else {
+    # If no population data, use relative scale
+    absolute_rate <- exp(linear_pred)
+    cat("Note: Using relative scale due to lack of population data\n")
+  }
+  
+  # Calculate turning point
+  if(!is.na(temp_quad_coef) && temp_quad_coef != 0) {
+    turning_point_centered <- -temp_linear_coef / (2 * temp_quad_coef)
+    turning_point_actual <- turning_point_centered + reference_temp
+    cat("Turning point temperature:", round(turning_point_actual, 2), "°C\n")
+  } else {
+    turning_point_actual <- NA
+  }
+  
+  results <- data.frame(
+    temperature = temp_seq,
+    temperature_centered = temp_seq_centered,
+    linear_prediction = linear_pred,
+    absolute_rate = absolute_rate,
+    turning_point = turning_point_actual,
+    reference_temp = reference_temp
+  )
+  
+  cat("Absolute risk calculation completed\n")
+  
+  return(results)
+}
+
+##############################################################
+# 3B. Plot stratified chart (modified version - remove extreme percentile lines, adjust colors)
+##############################################################
+
+plot_temperature_risk_with_distribution <- function(relative_results, temp_data, data, title_suffix = "", 
+                                                    save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  turning_point <- unique(relative_results$turning_point)[1]
+  reference_temp <- unique(relative_results$reference_temp)[1]
+  
+  # Define color scheme - modified version
+  main_line_color <- "#3377bb"       # Medium blue main line
+  ci_fill_color <- "#99ccee"         # Light blue confidence interval
+  hist_fill_color <- "#99ccee"       # Consistent blue
+  grid_color <- "#e6e6e6"            # Light gray grid lines
+  text_color <- "#333333"            # Dark gray text
+  mean_line_color <- "#0066cc"       # Blue mean line
+  ref_line_color <- "#ffb3d9"        # Light pink reference line
+  
+  # Determine chart size and layout parameters - golden ratio
+  layout_heights <- c(0.618, 0.382)  # Golden ratio
+  
+  # Create PNG image
+  png_file <- file.path(save_path, paste0("temperature_risk_distribution", title_suffix, ".png"))
+  png(filename = png_file, width = 10, height = 8, units = "in", res = 300)
+  
+  # Set layout
+  layout(matrix(c(1,2), nrow = 2, byrow = TRUE), heights = layout_heights)
+  
+  # Set plot parameters - top plot
+  par(mar = c(0, 5, 4, 2), cex.axis = 1.1, cex.lab = 1.2, family = "sans")
+  
+  # Top plot: Temperature direct effect on chikungunya
+  rr_range <- range(c(relative_results$relative_risk, relative_results$ci_lower, relative_results$ci_upper), na.rm = TRUE)
+  
+  # Adjust Y-axis range to ensure complete data coverage
+  y_min <- min(rr_range[1] * 0.8, 0.1)  # At least to 0.1
+  y_max <- max(rr_range[2] * 1.3, 2.0)  # Leave more space
+  
+  plot(relative_results$temperature, relative_results$relative_risk, type = 'n', 
+       ylim = c(y_min, y_max),
+       xlim = range(relative_results$temperature),
+       xlab = "", ylab = "", axes = FALSE, log = "y")
+  
+  # Add grid lines
+  temp_breaks <- pretty(relative_results$temperature, n = 8)
+  
+  # Better Y-axis scale
+  if(y_max <= 2) {
+    y_breaks <- c(0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0)
+  } else if(y_max <= 5) {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 3.0, 5.0)
+  } else if(y_max <= 10) {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
+  } else {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0)
+  }
+  y_breaks <- y_breaks[y_breaks >= y_min * 0.8 & y_breaks <= y_max * 1.2]
+  
+  abline(h = y_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  abline(v = temp_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  
+  # Add reference lines - modified colors
+  abline(h = 1, col = "gray40", lty = 2, lwd = 1.2)
+  abline(v = reference_temp, col = ref_line_color, lty = 2, lwd = 2)  # Light pink dashed reference temperature line
+  
+  # Add confidence interval
+  polygon_x <- c(relative_results$temperature, rev(relative_results$temperature))
+  polygon_y <- c(relative_results$ci_lower, rev(relative_results$ci_upper))
+  polygon(polygon_x, polygon_y, col = add.alpha(ci_fill_color, 0.2), border = NA)
+  
+  # Draw main curve
+  lines(relative_results$temperature, relative_results$relative_risk, lwd = 2.5, col = main_line_color)
+  
+  # Add reference point marker
+  ref_idx <- which.min(abs(relative_results$temperature - reference_temp))
+  points(relative_results$temperature[ref_idx], relative_results$relative_risk[ref_idx], 
+         col = "gray20", pch = 19, cex = 1.5)
+  
+  # Add turning point marker (if exists)
+  if(!is.na(turning_point)) {
+    tp_idx <- which.min(abs(relative_results$temperature - turning_point))
+    points(relative_results$temperature[tp_idx], relative_results$relative_risk[tp_idx], 
+           col = "red", pch = 17, cex = 1.5)
+  }
+  
+  # Add Y-axis (logarithmic scale)
+  axis(2, at = y_breaks, labels = as.character(y_breaks), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Relative Risk Ratio (95% CI)", side = 2, line = 3.5, cex = 1.2, col = text_color)
+  
+  # Add title
+  mtext("Temperature Effect on Chikungunya Incidence Risk", side = 3, line = 1, cex = 1.5, font = 2, col = text_color)
+  
+  # Bottom plot: Temperature frequency distribution histogram
+  par(mar = c(4.5, 5, 0.5, 2))
+  
+  # Filter temperature data to display range
+  temp_filtered <- temp_data[temp_data >= min(relative_results$temperature) & 
+                               temp_data <= max(relative_results$temperature)]
+  
+  # Create histogram intervals
+  actual_min <- min(temp_filtered, na.rm = TRUE)
+  actual_max <- max(temp_filtered, na.rm = TRUE)
+  buffer <- 0.1
+  safe_min <- floor(actual_min - buffer)
+  safe_max <- ceiling(actual_max + buffer)
+  
+  hist_breaks <- seq(safe_min, safe_max, by = 1)
+  if (max(hist_breaks) < safe_max) {
+    hist_breaks <- c(hist_breaks, safe_max)
+  }
+  
+  # Create histogram
+  hist_result <- hist(temp_filtered, breaks = hist_breaks, plot = FALSE)
+  hist_percent <- hist_result$counts / sum(hist_result$counts) * 100
+  
+  # Draw histogram background
+  plot(1, 1, type = "n", 
+       xlim = range(relative_results$temperature), 
+       ylim = c(0, max(hist_percent) * 1.2), 
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # Add bar chart
+  for(i in 1:length(hist_percent)) {
+    if(hist_breaks[i] <= max(relative_results$temperature) && 
+       hist_breaks[i+1] >= min(relative_results$temperature)) {
+      rect(hist_breaks[i], 0, hist_breaks[i+1], hist_percent[i], 
+           col = add.alpha(hist_fill_color, 0.7), 
+           border = add.alpha("gray80", 0.5))
+    }
+  }
+  
+  # Add X-axis
+  axis(1, at = temp_breaks, labels = temp_breaks, col.axis = text_color, col = "gray70")
+  mtext("Temperature (°C)", side = 1, line = 3, cex = 1.2, col = text_color)
+  
+  # Add temperature reference lines - modified colors and remove extreme percentile lines
+  abline(v = reference_temp, col = ref_line_color, lty = 2, lwd = 2)  # Light pink dashed reference temperature line
+  
+  # Add mean line - blue
+  temp_mean <- mean(temp_filtered, na.rm = TRUE)
+  abline(v = temp_mean, col = mean_line_color, lty = 1, lwd = 1.5)  # Blue mean line
+  
+  # Add Y-axis
+  y_ticks <- pretty(c(0, max(hist_percent)), n = 5)
+  axis(2, at = y_ticks, labels = paste0(format(y_ticks, digits = 1), "%"), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Sample Distribution\nFrequency (%)", side = 2, line = 2.8, cex = 1.2, col = text_color)
+  
+  # Add statistical information annotations - only show mean, remove extreme percentile information
+  text(temp_mean, max(hist_percent) * 0.9, 
+       sprintf("Mean: %.1f°C", temp_mean), 
+       cex = 0.9, col = mean_line_color)
+  
+  # Add border
+  box(col = "gray70")
+  
+  dev.off()
+  
+  cat("Modified temperature risk chart saved to:", png_file, "\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("Temperature mean:", round(temp_mean, 1), "°C\n")
+  
+  return(png_file)
+}
+
+##############################################################
+# 4. Data checking function
+##############################################################
+
+check_data_requirements_simple <- function(data) {
+  
+  cat("=== Data Requirements Check ===\n")
+  
+  required_vars <- c("temperature_mean", "cases", 
+                     "humidity_mean", "pressure_mean", "wind_speed_mean",
+                     "cityid", "year_month", "log_population")
+  
+  missing_vars <- required_vars[!required_vars %in% names(data)]
+  
+  if(length(missing_vars) > 0) {
+    cat("Missing variables:", paste(missing_vars, collapse = ", "), "\n")
+    cat("Please ensure data contains all the above variables\n")
+    return(FALSE)
+  }
+  
+  cat("✓ All required variables present\n")
+  
+  # Check temperature range
+  temp_range <- range(data$temperature_mean, na.rm = TRUE)
+  cat("Temperature range:", round(temp_range[1], 1), "to", round(temp_range[2], 1), "°C\n")
+  
+  cat("Data check completed\n\n")
+  return(TRUE)
+}
+
+##############################################################
+# 5. Main analysis function (modified version - filter extreme data first)
+##############################################################
+
+run_temperature_analysis_with_distribution <- function(data_clean, reference_temp = 18.0, 
+                                                       centering_method = "reference",
+                                                       save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("=== Starting Temperature Centered Quadratic Analysis (Extreme Data Filtering Version) ===\n")
+  cat("Original data rows:", nrow(data_clean), "\n")
+  cat("Centering method:", centering_method, "\n")
+  cat("Image save path:", save_path, "\n")
+  
+  # Ensure save path exists
+  if(!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+    cat("Created save path:", save_path, "\n")
+  }
+  
+  # [New step]: Filter extreme data
+  data_filtered <- filter_extreme_temperatures(data_clean)
+  
+  # Determine centering reference point
+  if(centering_method == "mean") {
+    actual_reference <- mean(data_filtered$temperature_mean, na.rm = TRUE)
+    cat("Using mean centering, reference point:", round(actual_reference, 1), "°C\n")
+  } else {
+    actual_reference <- reference_temp
+    cat("Using specified reference point:", round(actual_reference, 1), "°C\n")
+  }
+  
+  # Show filtered temperature range
+  temp_range <- range(data_filtered$temperature_mean, na.rm = TRUE)
+  cat("Filtered temperature range:", round(temp_range[1], 1), "to", round(temp_range[2], 1), "°C\n")
+  
+  # Step 1: Estimate centered quadratic model (using filtered data)
+  model_quadratic <- estimate_temp_quadratic_model_centered(data_filtered, actual_reference)
+  
+  # Step 2: Calculate marginal effects (corrected version - relative risk)
+  pred_quadratic <- calculate_temperature_marginal_effects(model_quadratic, temp_range, actual_reference)
+  
+  # Step 3: Calculate absolute risk (exposure-response curve)
+  abs_risk <- calculate_absolute_risk(model_quadratic, temp_range, data_filtered, actual_reference)
+  
+  # Step 4: Create stratified plot (risk curve + temperature distribution) - using filtered data
+  plot_file <- plot_temperature_risk_with_distribution(
+    relative_results = pred_quadratic,
+    temp_data = data_filtered$temperature_mean,  # Use filtered data
+    data = data_filtered,
+    title_suffix = "_filtered",
+    save_path = save_path
+  )
+  
+  # Verify reference point
+  cat("\n=== Reference Point Verification ===\n")
+  ref_idx <- which.min(abs(pred_quadratic$temperature - actual_reference))
+  cat("Quadratic model risk ratio at reference temperature", round(actual_reference, 1), "°C:", 
+      round(pred_quadratic$relative_risk[ref_idx], 4), "\n")
+  cat("(Should be close to 1.0, proving centering is correct)\n")
+  
+  # Temperature range analysis
+  cat("\n=== Filtered Temperature Range Analysis ===\n")
+  cat("Filtered data covers temperature range:", round(temp_range[1], 1), "°C to", round(temp_range[2], 1), "°C\n")
+  cat("Temperature span:", round(temp_range[2] - temp_range[1], 1), "°C\n")
+  
+  # Extreme temperature risks (within filtered range)
+  low_temp_idx <- which.min(pred_quadratic$temperature)
+  high_temp_idx <- which.max(pred_quadratic$temperature)
+  abs_low_idx <- which.min(abs_risk$temperature)
+  abs_high_idx <- which.max(abs_risk$temperature)
+  
+  cat("Lowest temperature", round(pred_quadratic$temperature[low_temp_idx], 1), "°C risk:\n")
+  cat("  - Relative risk ratio:", round(pred_quadratic$relative_risk[low_temp_idx], 3), "\n")
+  cat("  - Absolute incidence rate:", round(abs_risk$absolute_rate[abs_low_idx], 2), "\n")
+  
+  cat("Highest temperature", round(pred_quadratic$temperature[high_temp_idx], 1), "°C risk:\n")
+  cat("  - Relative risk ratio:", round(pred_quadratic$relative_risk[high_temp_idx], 3), "\n")
+  cat("  - Absolute incidence rate:", round(abs_risk$absolute_rate[abs_high_idx], 2), "\n")
+  
+  # Return results
+  return(list(
+    model_quadratic = model_quadratic,
+    predictions_quadratic = pred_quadratic,
+    absolute_risk = abs_risk,
+    plot_file = plot_file,
+    reference_temp = actual_reference,
+    data_original = data_clean,     # Original data
+    data_filtered = data_filtered,  # Filtered data
+    centering_method = centering_method,
+    temperature_range = temp_range,
+    save_path = save_path
+  ))
+}
+
+##############################################################
+# 6. Usage examples (modified version)
+##############################################################
+
+# Main analysis function call example
+if(exists("data_clean")) {
+  
+  cat("=== data_clean dataset detected ===\n")
+  
+  # Data check
+  if(check_data_requirements_simple(data_clean)) {
+    
+    # Run main analysis (extreme data filtering version)
+    cat("Starting temperature centered quadratic analysis (extreme data filtering version)...\n")
+    results_filtered <- run_temperature_analysis_with_distribution(
+      data_clean, 
+      reference_temp = 18.0,  # Reference temperature 18°C
+      centering_method = "reference",  # Reference point centering
+      save_path = "C:/Users/a1230/Desktop/picture"  # Image save path
+    )
+    
+    cat("\n=== Extreme Data Filtering Version Analysis Completed ===\n")
+    cat("Available results:\n")
+    cat("- results_filtered$model_quadratic: Centered quadratic model object\n")
+    cat("- results_filtered$predictions_quadratic: Relative risk prediction results\n")
+    cat("- results_filtered$absolute_risk: Absolute risk prediction results\n")
+    cat("- results_filtered$plot_file: Saved image file path\n")
+    cat("- results_filtered$data_original: Original data\n")
+    cat("- results_filtered$data_filtered: Filtered data\n")
+    cat("- results_filtered$temperature_range: Filtered temperature range\n")
+    
+  } else {
+    cat("Data check failed, please check data format\n")
+  }
+  
+} else {
+  
+  cat("=== Usage Instructions (Extreme Data Filtering Version) ===\n")
+  cat("Please prepare data_clean dataset first, containing the following variables:\n\n")
+  cat("Required variables:\n")
+  cat("- temperature_mean: Mean temperature\n")
+  cat("- cases: Case count\n")
+  cat("- humidity_mean: Mean humidity\n")
+  cat("- pressure_mean: Mean pressure\n")
+  cat("- wind_speed_mean: Mean wind speed\n")
+  cat("- cityid: City ID\n")
+  cat("- year_month: Year-month\n")
+  cat("- log_population: Population logarithm\n\n")
+  
+  cat("Usage:\n")
+  cat("# Check data\n")
+  cat("check_data_requirements_simple(data_clean)\n\n")
+  cat("# Run complete analysis (extreme data filtering version)\n")
+  cat("results_filtered <- run_temperature_analysis_with_distribution(\n")
+  cat("  data_clean,\n")
+  cat("  reference_temp = 18.0,  # Reference temperature 18°C\n")
+  cat("  centering_method = 'reference',  # Reference point centering\n")
+  cat("  save_path = 'C:/Users/a1230/Desktop/picture'  # Image save path\n")
+  cat(")\n\n")
+  
+}
+
+cat("\n=== Extreme Data Filtering Version Features (V3.0 Update) ===\n")
+cat("1. ✅ Automatically remove extreme temperature data outside 1% and 99% percentiles\n")
+cat("2. ✅ Removed 1% and 99% percentile dashed line markers\n")
+cat("3. ✅ Mean line changed to blue solid line\n")
+cat("4. ✅ Reference temperature line changed to light pink dashed line\n")
+cat("5. ✅ Maintain 18°C reference temperature setting\n")
+cat("6. ✅ Maintain original stratified layout and color scheme\n")
+cat("7. ✅ Improved Y-axis scale, better adapted to filtered data range\n")
+cat("8. ✅ Save both original and filtered data for comparison\n")
+
+cat("\n=== Image Output (Extreme Data Filtering Version V3.0) ===\n")
+cat("Save path: C:/Users/a1230/Desktop/picture/\n")
+cat("Filename: temperature_risk_distribution_filtered.png\n")
+cat("Format: High-resolution PNG (300dpi, 10x8 inches)\n")
+cat("Reference lines: 18°C light pink dashed line, temperature mean blue solid line\n")
+cat("Data range: Automatically filter out extreme values outside 1%-99% range\n")
+
+cat("\n=== Temperature Extreme Data Filtering Analysis Code V3.0 Ready ===\n")

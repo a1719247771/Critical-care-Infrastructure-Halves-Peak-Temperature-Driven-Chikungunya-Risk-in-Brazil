@@ -1,0 +1,900 @@
+library(fixest)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+
+##############################################################
+# Helper function: Add transparency
+##############################################################
+add.alpha <- function(col, alpha=1) {
+  apply(sapply(col, col2rgb)/255, 2, 
+        function(x) rgb(x[1], x[2], x[3], alpha))
+}
+
+##############################################################
+# New: Data filtering function - Remove extreme data outside 1% and 99% percentiles
+##############################################################
+filter_extreme_temperatures <- function(data) {
+  
+  cat("\n=== Filtering Extreme Temperature Data ===\n")
+  
+  # Calculate 1% and 99% percentiles
+  temp_p1 <- quantile(data$temperature_mean, 0.01, na.rm = TRUE)
+  temp_p99 <- quantile(data$temperature_mean, 0.99, na.rm = TRUE)
+  
+  cat("Original data rows:", nrow(data), "\n")
+  cat("Temperature range:", round(range(data$temperature_mean, na.rm = TRUE), 1), "°C\n")
+  cat("1% percentile:", round(temp_p1, 1), "°C\n")
+  cat("99% percentile:", round(temp_p99, 1), "°C\n")
+  
+  # Filter data: keep data within 1%-99% range
+  data_filtered <- data[data$temperature_mean >= temp_p1 & 
+                          data$temperature_mean <= temp_p99, ]
+  
+  # Remove NA values
+  data_filtered <- data_filtered[!is.na(data_filtered$temperature_mean), ]
+  
+  cat("Filtered data rows:", nrow(data_filtered), "\n")
+  cat("Removed extreme data:", nrow(data) - nrow(data_filtered), "rows\n")
+  cat("Filtered temperature range:", round(range(data_filtered$temperature_mean, na.rm = TRUE), 1), "°C\n")
+  
+  return(data_filtered)
+}
+
+##############################################################
+# 1. Create temperature bins function (optimized version)
+##############################################################
+
+create_temperature_bins_optimized <- function(data, temp_var = "temperature_mean", n_bins = 12, reference_temp = 18) {
+  
+  cat("=== Creating Temperature Bins (Optimized Version) ===\n")
+  cat("Target reference temperature:", reference_temp, "°C\n")
+  cat("Number of bins:", n_bins, "\n")
+  
+  # Calculate temperature quantiles
+  temp_quantiles <- quantile(data[[temp_var]], 
+                             probs = seq(0, 1, length.out = n_bins + 1), 
+                             na.rm = TRUE)
+  
+  cat("Temperature quantile cutpoints:\n")
+  print(round(temp_quantiles, 1))
+  
+  # Create temperature bins
+  data$temp_bin <- cut(data[[temp_var]], 
+                       breaks = temp_quantiles,
+                       include.lowest = TRUE,
+                       labels = paste0("tbin", 1:n_bins))
+  
+  # Find bin closest to reference temperature
+  temp_bin_centers <- data %>%
+    group_by(temp_bin) %>%
+    summarise(temp_center = mean(.data[[temp_var]], na.rm = TRUE), .groups = 'drop')
+  
+  closest_bin_idx <- which.min(abs(temp_bin_centers$temp_center - reference_temp))
+  reference_bin <- paste0("tbin", closest_bin_idx)
+  
+  cat("Selected reference bin:", reference_bin, ", center temperature:", 
+      round(temp_bin_centers$temp_center[closest_bin_idx], 1), "°C\n")
+  
+  # Set reference bin as baseline
+  data$temp_bin <- relevel(factor(data$temp_bin), ref = reference_bin)
+  
+  # Create bin statistics table
+  bin_stats <- data %>%
+    group_by(temp_bin) %>%
+    summarise(
+      n_obs = n(),
+      temp_min = round(min(.data[[temp_var]], na.rm = TRUE), 1),
+      temp_max = round(max(.data[[temp_var]], na.rm = TRUE), 1),
+      temp_mean = round(mean(.data[[temp_var]], na.rm = TRUE), 1),
+      cases_total = sum(cases, na.rm = TRUE),
+      cases_rate = round(sum(cases, na.rm = TRUE) / n() * 1000, 2),
+      .groups = 'drop'
+    )
+  
+  cat("\nTemperature bin statistics:\n")
+  print(bin_stats)
+  
+  return(list(data = data, bin_stats = bin_stats, reference_bin = reference_bin, 
+              temp_bin_centers = temp_bin_centers))
+}
+
+##############################################################
+# 2. Create temperature bin indicator variables
+##############################################################
+
+create_temp_bins_variables <- function(data, n_bins = 12) {
+  
+  cat("\n=== Creating Temperature Bin Indicator Variables ===\n")
+  
+  # Create indicator variables for each temperature bin
+  for(i in 1:n_bins) {
+    bin_name <- paste0("tbin", i)
+    data[[paste0("temp_", bin_name)]] <- as.numeric(data$temp_bin == bin_name)
+  }
+  
+  cat("Created temperature bin variables:", n_bins, "variables\n")
+  
+  return(data)
+}
+
+##############################################################
+# 3. Estimate binned model (detailed version)
+##############################################################
+
+estimate_temp_binned_model_detailed <- function(data, reference_bin, n_bins = 12) {
+  
+  cat("\n=== Estimating Temperature Binned Model (Detailed Version) ===\n")
+  cat("Reference bin:", reference_bin, "\n")
+  
+  ref_num <- as.numeric(gsub("tbin", "", reference_bin))
+  
+  # Build temperature bin terms (excluding reference bin)
+  temp_terms <- c()
+  for(i in 1:n_bins) {
+    if(i != ref_num) {
+      temp_terms <- c(temp_terms, paste0("temp_tbin", i))
+    }
+  }
+  
+  # Basic control variables
+  control_vars <- c("humidity_mean", "pressure_mean", "wind_speed_mean")
+  
+  # Check and add other control variables
+  additional_vars <- c("ICU", "hospital", "log_pop_density", "forest", "farming", "urban")
+  available_additional <- additional_vars[additional_vars %in% names(data)]
+  
+  if(length(available_additional) > 0) {
+    cat("Included additional control variables:", paste(available_additional, collapse = ", "), "\n")
+    control_vars <- c(control_vars, available_additional)
+  }
+  
+  # Build complete model formula
+  all_vars <- c(control_vars, temp_terms)
+  formula_str <- paste("cases ~", paste(all_vars, collapse = " + "), "| cityid + year_month")
+  
+  cat("Binned model formula:\n")
+  cat(formula_str, "\n")
+  
+  # Estimate model
+  if("log_population" %in% names(data)) {
+    model <- fepois(as.formula(formula_str), 
+                    offset = ~log_population, 
+                    data = data)
+  } else {
+    model <- fepois(as.formula(formula_str), 
+                    data = data)
+  }
+  
+  cat("Binned model estimation completed\n")
+  
+  # ===== Print detailed binned model results =====
+  cat("\n=== Binned Model Detailed Results ===\n")
+  
+  # Print model summary
+  print(summary(model))
+  
+  # Extract and print temperature-related coefficients
+  cat("\n=== Temperature Bin Coefficient Details ===\n")
+  model_coef <- coef(model)
+  model_se <- se(model)
+  
+  # Find temperature-related coefficients
+  temp_coef_names <- names(model_coef)[grepl("temp_tbin", names(model_coef))]
+  
+  if(length(temp_coef_names) > 0) {
+    temp_results <- data.frame(
+      Bin = temp_coef_names,
+      Coefficient = round(model_coef[temp_coef_names], 6),
+      Std_Error = round(model_se[temp_coef_names], 6),
+      t_value = round(model_coef[temp_coef_names] / model_se[temp_coef_names], 3),
+      p_value = round(2 * (1 - pnorm(abs(model_coef[temp_coef_names] / model_se[temp_coef_names]))), 4),
+      Relative_Risk = round(exp(model_coef[temp_coef_names]), 3),
+      row.names = NULL
+    )
+    print(temp_results)
+  }
+  
+  # Print model fit statistics
+  cat("\n=== Model Fit Statistics ===\n")
+  cat("AIC:", round(AIC(model), 2), "\n")
+  cat("BIC:", round(BIC(model), 2), "\n")
+  cat("Log-likelihood:", round(as.numeric(logLik(model)), 2), "\n")
+  cat("Number of observations:", nobs(model), "\n")
+  
+  # Print other control variable coefficients
+  cat("\n=== Main Control Variable Coefficients ===\n")
+  main_controls <- c("humidity_mean", "pressure_mean", "wind_speed_mean")
+  control_coef_names <- names(model_coef)[names(model_coef) %in% main_controls]
+  
+  if(length(control_coef_names) > 0) {
+    control_results <- data.frame(
+      Variable = control_coef_names,
+      Coefficient = round(model_coef[control_coef_names], 4),
+      Std_Error = round(model_se[control_coef_names], 4),
+      t_value = round(model_coef[control_coef_names] / model_se[control_coef_names], 3),
+      row.names = NULL
+    )
+    print(control_results)
+  }
+  
+  cat("\n=== Binned Model Results Output Completed ===\n")
+  
+  return(model)
+}
+
+##############################################################
+# 4. Calculate binned predictions (corrected version)
+##############################################################
+
+calculate_temp_predictions_corrected <- function(model, bin_stats, reference_bin, n_bins = 12, alpha = 0.05) {
+  
+  cat("\n=== Calculating Temperature Bin Predictions (Corrected Version) ===\n")
+  cat("Reference bin:", reference_bin, "\n")
+  
+  coef_est <- coef(model)
+  vcov_matrix <- vcov(model)
+  
+  results <- data.frame()
+  ref_num <- as.numeric(gsub("tbin", "", reference_bin))
+  
+  for(i in 1:n_bins) {
+    bin_name <- paste0("tbin", i)
+    bin_info <- bin_stats[bin_stats$temp_bin == bin_name, ]
+    
+    if(i == ref_num) {
+      # Reference bin coefficient is 0
+      coef_val <- 0
+      se_val <- 0
+      cat("Reference bin", bin_name, "coefficient set to 0\n")
+    } else {
+      # Non-reference bins
+      var_name <- paste0("temp_tbin", i)
+      
+      if(var_name %in% names(coef_est)) {
+        coef_val <- coef_est[var_name]
+        se_val <- sqrt(vcov_matrix[var_name, var_name])
+      } else {
+        coef_val <- 0
+        se_val <- 0
+        cat("Variable", var_name, "not found, set to 0\n")
+      }
+    }
+    
+    # Calculate relative risk ratio and confidence interval
+    rr <- exp(coef_val)
+    ci_lower <- exp(coef_val - qnorm(1 - alpha/2) * se_val)
+    ci_upper <- exp(coef_val + qnorm(1 - alpha/2) * se_val)
+    
+    results <- rbind(results, data.frame(
+      temp_bin = bin_name,
+      bin_number = i,
+      temp_mean = bin_info$temp_mean,
+      temp_min = bin_info$temp_min,
+      temp_max = bin_info$temp_max,
+      n_obs = bin_info$n_obs,
+      coefficient = coef_val,
+      std_error = se_val,
+      relative_risk = rr,
+      ci_lower = ci_lower,
+      ci_upper = ci_upper,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Sort by temperature
+  results <- results[order(results$temp_mean), ]
+  
+  cat("Prediction calculation completed,", nrow(results), "data points\n")
+  
+  # Verify reference point
+  ref_idx <- which(results$bin_number == ref_num)
+  cat("Reference bin risk ratio at", round(results$temp_mean[ref_idx], 1), "°C:", 
+      round(results$relative_risk[ref_idx], 4), "\n")
+  cat("(Should = 1.0, proving binning is correct)\n")
+  
+  return(results)
+}
+
+##############################################################
+# 5. Plot binned chart (optimized version - remove extreme percentile lines, adjust colors)
+##############################################################
+
+plot_temperature_binned_with_distribution <- function(binned_results, temp_data, data, reference_bin,
+                                                      title_suffix = "", 
+                                                      save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  reference_temp <- binned_results$temp_mean[binned_results$temp_bin == reference_bin]
+  
+  # Define color scheme - modified version
+  main_line_color <- "#3377bb"       # Medium blue main line
+  ci_fill_color <- "#99ccee"         # Light blue confidence interval
+  hist_fill_color <- "#99ccee"       # Consistent blue
+  grid_color <- "#e6e6e6"            # Light gray grid lines
+  text_color <- "#333333"            # Dark gray text
+  mean_line_color <- "#0066cc"       # Blue mean line
+  ref_line_color <- "#ffb3d9"        # Light pink reference line
+  
+  # Determine chart size and layout parameters - golden ratio
+  layout_heights <- c(0.618, 0.382)  # Golden ratio
+  
+  # Create PNG image
+  png_file <- file.path(save_path, paste0("temperature_binned_distribution", title_suffix, ".png"))
+  png(filename = png_file, width = 10, height = 8, units = "in", res = 300)
+  
+  # Set layout
+  layout(matrix(c(1,2), nrow = 2, byrow = TRUE), heights = layout_heights)
+  
+  # Set plot parameters - top plot
+  par(mar = c(0, 5, 4, 2), cex.axis = 1.1, cex.lab = 1.2, family = "sans")
+  
+  # Top plot: Temperature direct effect on chikungunya
+  rr_range <- range(c(binned_results$relative_risk, binned_results$ci_lower, binned_results$ci_upper), na.rm = TRUE)
+  
+  # Adjust Y-axis range to ensure complete data coverage
+  y_min <- min(rr_range[1] * 0.8, 0.1)  # At least to 0.1
+  y_max <- max(rr_range[2] * 1.3, 2.0)  # Leave more space
+  
+  plot(binned_results$temp_mean, binned_results$relative_risk, type = 'n', 
+       ylim = c(y_min, y_max),
+       xlim = range(binned_results$temp_mean),
+       xlab = "", ylab = "", axes = FALSE, log = "y")
+  
+  # Add grid lines
+  temp_breaks <- pretty(binned_results$temp_mean, n = 8)
+  
+  # Better Y-axis scale
+  if(y_max <= 2) {
+    y_breaks <- c(0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0)
+  } else if(y_max <= 5) {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 3.0, 5.0)
+  } else if(y_max <= 10) {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
+  } else {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0)
+  }
+  y_breaks <- y_breaks[y_breaks >= y_min * 0.8 & y_breaks <= y_max * 1.2]
+  
+  abline(h = y_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  abline(v = temp_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  
+  # Add reference lines - modified colors
+  abline(h = 1, col = "gray40", lty = 2, lwd = 1.2)
+  abline(v = reference_temp, col = ref_line_color, lty = 2, lwd = 2)  # Light pink dashed reference temperature line
+  
+  # Add confidence interval error bars
+  for(i in 1:nrow(binned_results)) {
+    segments(binned_results$temp_mean[i], binned_results$ci_lower[i],
+             binned_results$temp_mean[i], binned_results$ci_upper[i],
+             col = add.alpha(ci_fill_color, 0.6), lwd = 2)
+    # Add error bar endpoints
+    segments(binned_results$temp_mean[i] - 0.3, binned_results$ci_lower[i],
+             binned_results$temp_mean[i] + 0.3, binned_results$ci_lower[i],
+             col = add.alpha(ci_fill_color, 0.6), lwd = 1.5)
+    segments(binned_results$temp_mean[i] - 0.3, binned_results$ci_upper[i],
+             binned_results$temp_mean[i] + 0.3, binned_results$ci_upper[i],
+             col = add.alpha(ci_fill_color, 0.6), lwd = 1.5)
+  }
+  
+  # Draw connecting lines
+  lines(binned_results$temp_mean, binned_results$relative_risk, lwd = 2.5, col = main_line_color)
+  
+  # Draw data points
+  points(binned_results$temp_mean, binned_results$relative_risk, 
+         col = main_line_color, pch = 21, cex = 2, 
+         bg = "white", lwd = 2)
+  
+  # Add reference point marker
+  ref_idx <- which(binned_results$temp_bin == reference_bin)
+  points(binned_results$temp_mean[ref_idx], binned_results$relative_risk[ref_idx], 
+         col = "gray20", pch = 19, cex = 1.8)
+  
+  # Add Y-axis (logarithmic scale)
+  axis(2, at = y_breaks, labels = as.character(y_breaks), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Relative Risk Ratio (95% CI)", side = 2, line = 3.5, cex = 1.2, col = text_color)
+  
+  # Add title
+  mtext("Temperature Effect on Chikungunya Incidence Risk (12-Bin Model)", side = 3, line = 1, cex = 1.5, font = 2, col = text_color)
+  
+  # Bottom plot: Temperature frequency distribution histogram
+  par(mar = c(4.5, 5, 0.5, 2))
+  
+  # Filter temperature data to display range
+  temp_filtered <- temp_data[temp_data >= min(binned_results$temp_mean) & 
+                               temp_data <= max(binned_results$temp_mean)]
+  
+  # Create histogram intervals
+  actual_min <- min(temp_filtered, na.rm = TRUE)
+  actual_max <- max(temp_filtered, na.rm = TRUE)
+  buffer <- 0.1
+  safe_min <- floor(actual_min - buffer)
+  safe_max <- ceiling(actual_max + buffer)
+  
+  hist_breaks <- seq(safe_min, safe_max, by = 1)
+  if (max(hist_breaks) < safe_max) {
+    hist_breaks <- c(hist_breaks, safe_max)
+  }
+  
+  # Create histogram
+  hist_result <- hist(temp_filtered, breaks = hist_breaks, plot = FALSE)
+  hist_percent <- hist_result$counts / sum(hist_result$counts) * 100
+  
+  # Draw histogram background
+  plot(1, 1, type = "n", 
+       xlim = range(binned_results$temp_mean), 
+       ylim = c(0, max(hist_percent) * 1.2), 
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # Add bar chart
+  for(i in 1:length(hist_percent)) {
+    if(hist_breaks[i] <= max(binned_results$temp_mean) && 
+       hist_breaks[i+1] >= min(binned_results$temp_mean)) {
+      rect(hist_breaks[i], 0, hist_breaks[i+1], hist_percent[i], 
+           col = add.alpha(hist_fill_color, 0.7), 
+           border = add.alpha("gray80", 0.5))
+    }
+  }
+  
+  # Add X-axis
+  axis(1, at = temp_breaks, labels = temp_breaks, col.axis = text_color, col = "gray70")
+  mtext("Temperature (°C)", side = 1, line = 3, cex = 1.2, col = text_color)
+  
+  # Add temperature reference lines - modified colors and remove extreme percentile lines
+  abline(v = reference_temp, col = ref_line_color, lty = 2, lwd = 2)  # Light pink dashed reference temperature line
+  
+  # Add mean line - blue
+  temp_mean <- mean(temp_filtered, na.rm = TRUE)
+  abline(v = temp_mean, col = mean_line_color, lty = 1, lwd = 1.5)  # Blue mean line
+  
+  # Add Y-axis
+  y_ticks <- pretty(c(0, max(hist_percent)), n = 5)
+  axis(2, at = y_ticks, labels = paste0(format(y_ticks, digits = 1), "%"), 
+       las = 1, col.axis = text_color, col = "gray70")
+  mtext("Sample Distribution\nFrequency (%)", side = 2, line = 2.8, cex = 1.2, col = text_color)
+  
+  # Add statistical information annotations - only show mean, remove extreme percentile information
+  text(temp_mean, max(hist_percent) * 0.9, 
+       sprintf("Mean: %.1f°C", temp_mean), 
+       cex = 0.9, col = mean_line_color)
+  
+  # Add border
+  box(col = "gray70")
+  
+  dev.off()
+  
+  cat("12-bin model temperature risk chart saved to:", png_file, "\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("Temperature mean:", round(temp_mean, 1), "°C\n")
+  
+  return(png_file)
+}
+
+##############################################################
+# 6. Data checking function
+##############################################################
+
+check_data_requirements_simple <- function(data) {
+  
+  cat("=== Data Requirements Check ===\n")
+  
+  required_vars <- c("temperature_mean", "cases", 
+                     "humidity_mean", "pressure_mean", "wind_speed_mean",
+                     "cityid", "year_month", "log_population")
+  
+  missing_vars <- required_vars[!required_vars %in% names(data)]
+  
+  if(length(missing_vars) > 0) {
+    cat("Missing variables:", paste(missing_vars, collapse = ", "), "\n")
+    cat("Please ensure data contains all the above variables\n")
+    return(FALSE)
+  }
+  
+  cat("✓ All required variables present\n")
+  
+  # Check temperature range
+  temp_range <- range(data$temperature_mean, na.rm = TRUE)
+  cat("Temperature range:", round(temp_range[1], 1), "to", round(temp_range[2], 1), "°C\n")
+  
+  cat("Data check completed\n\n")
+  return(TRUE)
+}
+
+##############################################################
+# 7. Main analysis function (modified version - filter extreme data first, change to 12-bin model)
+##############################################################
+
+run_temperature_binned_analysis_with_distribution <- function(data_clean, reference_temp = 18.0, 
+                                                              n_bins = 12,
+                                                              save_path = "C:/Users/a1230/Desktop/picture") {
+  
+  cat("=== Starting Temperature 12-Bin Analysis (Extreme Data Filtering Version) ===\n")
+  cat("Original data rows:", nrow(data_clean), "\n")
+  cat("Reference temperature:", reference_temp, "°C\n")
+  cat("Number of bins:", n_bins, "\n")
+  cat("Image save path:", save_path, "\n")
+  
+  # Ensure save path exists
+  if(!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+    cat("Created save path:", save_path, "\n")
+  }
+  
+  # [New step]: Filter extreme data
+  data_filtered <- filter_extreme_temperatures(data_clean)
+  
+  # Show filtered temperature range
+  temp_range <- range(data_filtered$temperature_mean, na.rm = TRUE)
+  cat("Filtered temperature range:", round(temp_range[1], 1), "to", round(temp_range[2], 1), "°C\n")
+  
+  # Step 1: Create temperature bins (using filtered data)
+  binning_result <- create_temperature_bins_optimized(data_filtered, n_bins = n_bins, reference_temp = reference_temp)
+  data_binned <- binning_result$data
+  bin_stats <- binning_result$bin_stats
+  reference_bin <- binning_result$reference_bin
+  
+  # Step 2: Create bin indicator variables
+  data_binned <- create_temp_bins_variables(data_binned, n_bins)
+  
+  # Step 3: Estimate binned model (using filtered data)
+  model_binned <- estimate_temp_binned_model_detailed(data_binned, reference_bin, n_bins)
+  
+  # Step 4: Calculate marginal effects (corrected version - relative risk)
+  pred_binned <- calculate_temp_predictions_corrected(model_binned, bin_stats, reference_bin, n_bins)
+  
+  # Step 5: Create stratified plot (risk curve + temperature distribution) - using filtered data
+  plot_file <- plot_temperature_binned_with_distribution(
+    binned_results = pred_binned,
+    temp_data = data_filtered$temperature_mean,  # Use filtered data
+    data = data_filtered,
+    reference_bin = reference_bin,
+    title_suffix = "_12bins_filtered",
+    save_path = save_path
+  )
+  
+  # Verify reference point
+  cat("\n=== Reference Point Verification ===\n")
+  ref_idx <- which(pred_binned$temp_bin == reference_bin)
+  cat("12-bin model risk ratio at reference temperature", round(reference_temp, 1), "°C:", 
+      round(pred_binned$relative_risk[ref_idx], 4), "\n")
+  cat("(Should be close to 1.0, proving binning is correct)\n")
+  
+  # Temperature range analysis
+  cat("\n=== Filtered Temperature Range Analysis ===\n")
+  cat("Filtered data covers temperature range:", round(temp_range[1], 1), "°C to", round(temp_range[2], 1), "°C\n")
+  cat("Temperature span:", round(temp_range[2] - temp_range[1], 1), "°C\n")
+  
+  # Extreme temperature risks (within filtered range)
+  low_temp_idx <- which.min(pred_binned$temp_mean)
+  high_temp_idx <- which.max(pred_binned$temp_mean)
+  
+  cat("Lowest temperature bin", pred_binned$temp_bin[low_temp_idx], " (", round(pred_binned$temp_mean[low_temp_idx], 1), "°C) risk:\n")
+  cat("  - Relative risk ratio:", round(pred_binned$relative_risk[low_temp_idx], 3), "\n")
+  cat("  - 95% confidence interval: [", round(pred_binned$ci_lower[low_temp_idx], 3), ", ", round(pred_binned$ci_upper[low_temp_idx], 3), "]\n")
+  
+  cat("Highest temperature bin", pred_binned$temp_bin[high_temp_idx], " (", round(pred_binned$temp_mean[high_temp_idx], 1), "°C) risk:\n")
+  cat("  - Relative risk ratio:", round(pred_binned$relative_risk[high_temp_idx], 3), "\n")
+  cat("  - 95% confidence interval: [", round(pred_binned$ci_lower[high_temp_idx], 3), ", ", round(pred_binned$ci_upper[high_temp_idx], 3), "]\n")
+  
+  # Return results
+  return(list(
+    model_binned = model_binned,
+    predictions_binned = pred_binned,
+    bin_stats = bin_stats,
+    plot_file = plot_file,
+    reference_temp = reference_temp,
+    reference_bin = reference_bin,
+    data_original = data_clean,     # Original data
+    data_filtered = data_filtered,  # Filtered data
+    data_processed = data_binned,   # Processed data
+    temperature_range = temp_range,
+    n_bins = n_bins,
+    save_path = save_path
+  ))
+}
+
+##############################################################
+# 8. Results interpretation function (12-bin model version)
+##############################################################
+
+interpret_binned_results <- function(results) {
+  
+  cat("\n=== 12-Bin Model Results Interpretation ===\n")
+  
+  # Binned model results
+  binned_pred <- results$predictions_binned
+  ref_bin <- results$reference_bin
+  
+  cat("1. 12-bin model results:\n")
+  cat("   Reference bin:", ref_bin, "\n")
+  cat("   Reference temperature:", round(results$reference_temp, 1), "°C\n")
+  cat("   Number of bins:", results$n_bins, "\n")
+  
+  # Find highest and lowest risk bins
+  max_risk_idx <- which.max(binned_pred$relative_risk)
+  min_risk_idx <- which.min(binned_pred$relative_risk)
+  
+  cat("   Highest risk bin:", binned_pred$temp_bin[max_risk_idx], 
+      " (", round(binned_pred$temp_mean[max_risk_idx], 1), "°C, RR=", 
+      round(binned_pred$relative_risk[max_risk_idx], 2), ")\n")
+  
+  cat("   Lowest risk bin:", binned_pred$temp_bin[min_risk_idx], 
+      " (", round(binned_pred$temp_mean[min_risk_idx], 1), "°C, RR=", 
+      round(binned_pred$relative_risk[min_risk_idx], 2), ")\n")
+  
+  # Risk range analysis
+  rr_range <- range(binned_pred$relative_risk)
+  cat("\n2. Risk range analysis:\n")
+  cat("   Relative risk ratio range:", round(rr_range[1], 2), "to", round(rr_range[2], 2), "\n")
+  cat("   Maximum risk multiplier:", round(rr_range[2] / rr_range[1], 2), "times\n")
+  
+  # Statistical significance analysis
+  cat("\n3. Statistical significance analysis:\n")
+  significant_bins <- binned_pred[binned_pred$ci_lower > 1 | binned_pred$ci_upper < 1, ]
+  if(nrow(significant_bins) > 0) {
+    cat("   Statistically significant bins:\n")
+    for(i in 1:nrow(significant_bins)) {
+      significance <- if(significant_bins$ci_lower[i] > 1) "increased risk" else "decreased risk"
+      cat("     ", significant_bins$temp_bin[i], " (", round(significant_bins$temp_mean[i], 1), "°C): ", 
+          significance, ", RR=", round(significant_bins$relative_risk[i], 2), 
+          " [", round(significant_bins$ci_lower[i], 2), "-", round(significant_bins$ci_upper[i], 2), "]\n")
+    }
+  } else {
+    cat("   No statistically significant bins (95% confidence intervals all include 1)\n")
+  }
+  
+  # Temperature gradient analysis
+  cat("\n4. Temperature gradient analysis:\n")
+  # Sort by temperature
+  binned_sorted <- binned_pred[order(binned_pred$temp_mean), ]
+  cat("   Risk trend from low to high temperature:\n")
+  for(i in 1:nrow(binned_sorted)) {
+    cat("     ", binned_sorted$temp_bin[i], " (", round(binned_sorted$temp_mean[i], 1), "°C): RR=", 
+        round(binned_sorted$relative_risk[i], 3), "\n")
+  }
+  
+  # Model quality assessment
+  cat("\n5. Model quality assessment:\n")
+  binned_aic <- AIC(results$model_binned)
+  cat("   AIC:", round(binned_aic, 1), "\n")
+  cat("   BIC:", round(BIC(results$model_binned), 1), "\n")
+  cat("   Number of observations:", nobs(results$model_binned), "\n")
+  
+  # Data filtering effect
+  cat("\n6. Data filtering effect:\n")
+  cat("   Original data:", nrow(results$data_original), "rows\n")
+  cat("   Filtered data:", nrow(results$data_filtered), "rows\n")
+  cat("   Filtering ratio:", round(nrow(results$data_filtered) / nrow(results$data_original) * 100, 1), "%\n")
+  
+  return(invisible())
+}
+
+##############################################################
+# 9. Sensitivity analysis function (different number of bins)
+##############################################################
+
+sensitivity_analysis_bins_filtered <- function(data_clean, bin_numbers = c(8, 10, 12, 15), reference_temp = 18) {
+  
+  cat("=== Sensitivity Analysis: Different Number of Bins (Extreme Data Filtering Version) ===\n")
+  
+  results_list <- list()
+  aic_comparison <- data.frame()
+  
+  for(n_bins in bin_numbers) {
+    cat("\n--- Analyzing", n_bins, "bins ---\n")
+    
+    tryCatch({
+      result <- run_temperature_binned_analysis_with_distribution(data_clean, 
+                                                                  reference_temp = reference_temp,
+                                                                  n_bins = n_bins,
+                                                                  save_path = "C:/Users/a1230/Desktop/picture")
+      results_list[[paste0("bins_", n_bins)]] <- result
+      
+      # Collect AIC information
+      aic_comparison <- rbind(aic_comparison, data.frame(
+        n_bins = n_bins,
+        aic = AIC(result$model_binned),
+        bic = BIC(result$model_binned),
+        loglik = as.numeric(logLik(result$model_binned)),
+        observations = nobs(result$model_binned)
+      ))
+      
+    }, error = function(e) {
+      cat("Analysis with", n_bins, "bins failed:", e$message, "\n")
+    })
+  }
+  
+  cat("\n=== Sensitivity Analysis Summary ===\n")
+  print(aic_comparison)
+  
+  # Find optimal number of bins
+  if(nrow(aic_comparison) > 0) {
+    best_aic_idx <- which.min(aic_comparison$aic)
+    best_bic_idx <- which.min(aic_comparison$bic)
+    
+    cat("\n=== Model Selection Recommendations ===\n")
+    cat("Optimal number of bins based on AIC:", aic_comparison$n_bins[best_aic_idx], "\n")
+    cat("Optimal number of bins based on BIC:", aic_comparison$n_bins[best_bic_idx], "\n")
+  }
+  
+  return(list(results = results_list, comparison = aic_comparison))
+}
+
+##############################################################
+# 10. Data export function (12-bin model version)
+##############################################################
+
+export_binned_results <- function(results, filename = "temperature_12bins_analysis.xlsx") {
+  
+  # Check if writexl package is available
+  if(!require(writexl, quietly = TRUE)) {
+    cat("writexl package not installed, trying basic export functionality\n")
+    # Use base R export
+    export_list <- list()
+    
+    # Binned prediction results
+    write.csv(results$predictions_binned, 
+              file = gsub("\\.xlsx$", "_predictions.csv", filename), 
+              row.names = FALSE)
+    
+    # Bin statistics
+    write.csv(results$bin_stats, 
+              file = gsub("\\.xlsx$", "_bin_stats.csv", filename), 
+              row.names = FALSE)
+    
+    cat("Results exported as CSV files\n")
+    return(invisible())
+  }
+  
+  # Prepare export data
+  export_list <- list()
+  
+  # 1. Binned prediction results
+  export_list[["12_Bin_Model_Predictions"]] <- results$predictions_binned
+  
+  # 2. Bin statistics
+  export_list[["Bin_Statistics"]] <- results$bin_stats
+  
+  # 3. Model coefficients
+  binned_coef <- coef(results$model_binned)
+  binned_se <- se(results$model_binned)
+  binned_results <- data.frame(
+    Variable = names(binned_coef),
+    Coefficient = as.numeric(binned_coef),
+    Std_Error = as.numeric(binned_se),
+    t_stat = as.numeric(binned_coef) / as.numeric(binned_se),
+    p_value = 2 * (1 - pnorm(abs(as.numeric(binned_coef) / as.numeric(binned_se)))),
+    Relative_Risk = exp(as.numeric(binned_coef))
+  )
+  export_list[["Model_Coefficients"]] <- binned_results
+  
+  # 4. Model information
+  model_info <- data.frame(
+    Information = c("AIC", "BIC", "Log-likelihood", "Observations", "Reference_Temp", "N_Bins", "Reference_Bin"),
+    Value = c(AIC(results$model_binned), 
+              BIC(results$model_binned),
+              as.numeric(logLik(results$model_binned)),
+              nobs(results$model_binned),
+              results$reference_temp,
+              results$n_bins,
+              results$reference_bin)
+  )
+  export_list[["Model_Information"]] <- model_info
+  
+  # 5. Data processing information
+  data_info <- data.frame(
+    Processing_Step = c("Original_Data_Rows", "Filtered_Data_Rows", "Processed_Data_Rows", "Filtering_Retention_Percent"),
+    Value = c(nrow(results$data_original),
+              nrow(results$data_filtered),
+              nrow(results$data_processed),
+              round(nrow(results$data_filtered) / nrow(results$data_original) * 100, 2))
+  )
+  export_list[["Data_Processing_Info"]] <- data_info
+  
+  # Export Excel file
+  tryCatch({
+    write_xlsx(export_list, filename)
+    cat("Results exported to:", filename, "\n")
+  }, error = function(e) {
+    cat("Excel export failed:", e$message, "\n")
+    cat("Trying to save as RDS format...\n")
+    saveRDS(export_list, gsub("\\.xlsx$", ".rds", filename))
+    cat("Saved as RDS format\n")
+  })
+  
+  return(export_list)
+}
+
+##############################################################
+# 11. Usage examples
+##############################################################
+
+# Main analysis function call example
+if(exists("data_clean")) {
+  
+  cat("=== data_clean dataset detected ===\n")
+  
+  # Data check
+  if(check_data_requirements_simple(data_clean)) {
+    
+    # Run main analysis
+    cat("Starting temperature 12-bin analysis (extreme data filtering version)...\n")
+    results_12bins <- run_temperature_binned_analysis_with_distribution(
+      data_clean, 
+      reference_temp = 18.0,  # Reference temperature 18°C
+      n_bins = 12,            # 12 bins
+      save_path = "C:/Users/a1230/Desktop/picture"  # Image save path
+    )
+    
+    # Interpret results
+    interpret_binned_results(results_12bins)
+    
+    # Export results
+    export_data <- export_binned_results(results_12bins, "temperature_12bins_analysis.xlsx")
+    
+    cat("\n=== Extreme Data Filtering Version 12-Bin Analysis Completed ===\n")
+    cat("Available results:\n")
+    cat("- results_12bins$model_binned: 12-bin model object\n")
+    cat("- results_12bins$predictions_binned: Binned prediction results\n")
+    cat("- results_12bins$bin_stats: Bin statistics information\n")
+    cat("- results_12bins$plot_file: Saved image file path\n")
+    cat("- results_12bins$data_original: Original data\n")
+    cat("- results_12bins$data_filtered: Filtered data\n")
+    cat("- results_12bins$data_processed: Processed data\n")
+    cat("- results_12bins$temperature_range: Filtered temperature range\n")
+    
+  } else {
+    cat("Data check failed, please check data format\n")
+  }
+  
+} else {
+  
+  cat("=== Usage Instructions (Extreme Data Filtering Version 12-Bin Model) ===\n")
+  cat("Please prepare data_clean dataset first, containing the following variables:\n\n")
+  cat("Required variables:\n")
+  cat("- temperature_mean: Mean temperature\n")
+  cat("- cases: Case count\n")
+  cat("- humidity_mean: Mean humidity\n")
+  cat("- pressure_mean: Mean pressure\n")
+  cat("- wind_speed_mean: Mean wind speed\n")
+  cat("- cityid: City ID\n")
+  cat("- year_month: Year-month\n")
+  cat("- log_population: Population logarithm\n\n")
+  
+  cat("Usage:\n")
+  cat("# Check data\n")
+  cat("check_data_requirements_simple(data_clean)\n\n")
+  cat("# Run complete analysis (extreme data filtering version 12-bin model)\n")
+  cat("results_12bins <- run_temperature_binned_analysis_with_distribution(\n")
+  cat("  data_clean,\n")
+  cat("  reference_temp = 18.0,  # Reference temperature 18°C\n")
+  cat("  n_bins = 12,            # 12 bins\n")
+  cat("  save_path = 'C:/Users/a1230/Desktop/picture'  # Image save path\n")
+  cat(")\n\n")
+  
+}
+
+cat("\n=== Extreme Data Filtering Version 12-Bin Model Features (V4.0 Update) ===\n")
+cat("1. ✅ Automatically remove extreme temperature data outside 1% and 99% percentiles\n")
+cat("2. ✅ Use 12-bin model (optimal bin number)\n")
+cat("3. ✅ 18°C reference temperature setting\n")
+cat("4. ✅ Removed 1% and 99% percentile dashed line markers\n")
+cat("5. ✅ Mean line changed to blue solid line\n")
+cat("6. ✅ Reference temperature line changed to light pink dashed line\n")
+cat("7. ✅ Maintain original stratified layout and color scheme\n")
+cat("8. ✅ Improved Y-axis scale, better adapted to filtered data range\n")
+cat("9. ✅ Save both original and filtered data for comparison\n")
+cat("10. ✅ Provide sensitivity analysis functionality (different bin numbers)\n")
+cat("11. ✅ More detailed temperature interval division (12 bins)\n")
+cat("12. ✅ More precise risk assessment and policy-making reference\n")
+
+cat("\n=== Image Output (Extreme Data Filtering Version 12-Bin Model V4.0) ===\n")
+cat("Save path: C:/Users/a1230/Desktop/picture/\n")
+cat("Filename: temperature_binned_distribution_12bins_filtered.png\n")
+cat("Format: High-resolution PNG (300dpi, 10x8 inches)\n")
+cat("Reference lines: 18°C light pink dashed line, temperature mean blue solid line\n")
+cat("Data range: Automatically filter out extreme values outside 1%-99% range\n")
+cat("Model type: 12-bin model (optimal complexity)\n")
+cat("Title: Temperature Effect on Chikungunya Incidence Risk (12-Bin Model)\n")
+
+cat("\n=== Temperature Extreme Data Filtering 12-Bin Analysis Code V4.0 Ready ===\n")
